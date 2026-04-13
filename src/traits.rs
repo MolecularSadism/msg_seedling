@@ -31,7 +31,7 @@ use bevy::prelude::*;
 /// }
 /// ```
 pub trait AudioCategory:
-    Component + Clone + Copy + Default + PartialEq + Eq + std::hash::Hash + Send + Sync + 'static
+    Component + Clone + Copy + Default + std::fmt::Debug + PartialEq + Eq + std::hash::Hash + Send + Sync + 'static
 {
     /// The configuration resource that provides volume settings.
     type Config: AudioConfig;

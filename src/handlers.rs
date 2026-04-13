@@ -48,6 +48,7 @@ pub fn handle_play_audio<C: AudioCategory>(
                 SpatialPool,
                 msg.category,
                 sample_effects![VolumeNode::from_linear(final_volume)],
+                Name::new(format!("{:?}", msg.category)),
             ))
         } else {
             commands.spawn((
@@ -55,6 +56,7 @@ pub fn handle_play_audio<C: AudioCategory>(
                 DefaultPool,
                 msg.category,
                 sample_effects![VolumeNode::from_linear(final_volume)],
+                Name::new(format!("{:?}", msg.category)),
             ))
         };
 
@@ -97,6 +99,7 @@ pub fn handle_play_audio<C: AudioCategory>(
                 SpatialPool,
                 msg.category,
                 sample_effects![VolumeNode::from_linear(category_volume)],
+                Name::new(format!("{:?}", msg.category)),
             ))
         } else {
             commands.spawn((
@@ -104,6 +107,7 @@ pub fn handle_play_audio<C: AudioCategory>(
                 DefaultPool,
                 msg.category,
                 sample_effects![VolumeNode::from_linear(category_volume)],
+                Name::new(format!("{:?}", msg.category)),
             ))
         };
 
