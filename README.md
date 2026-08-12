@@ -178,6 +178,34 @@ MsgSeedlingPlugin::<Sound>::new()
     .with_spatial_scale(Vec3::splat(1.0 / 100.0))  // 100 pixels = 1 audio unit
 ```
 
+## Following the OS Default Output Device
+
+`cpal` binds the audio stream to the concrete device that was the default when
+the stream opened and never rebinds it, and `bevy_seedling` only restarts the
+stream when it errors out (device removed). So switching the system default
+output — without the old device disappearing — would leave audio playing on
+the old device.
+
+On native targets, `MsgSeedlingPlugin` therefore polls the OS default output
+device (every second by default) and restarts the stream when it changes,
+as long as `AudioStreamConfig` does not pin a specific output device. A pinned
+device is always respected. On wasm the browser owns device routing, so this
+does nothing there.
+
+```rust
+// Change the poll interval
+MsgSeedlingPlugin::<Sound>::new()
+    .with_device_follow(FollowDefaultAudioDevice {
+        poll_interval: Duration::from_millis(500),
+    })
+
+// Or opt out entirely
+MsgSeedlingPlugin::<Sound>::new().without_device_follow()
+```
+
+At runtime, remove or insert the `FollowDefaultAudioDevice` resource to toggle
+the behavior.
+
 ## Architecture
 
 `msg_seedling` is a thin convenience layer over `bevy_seedling`. It does not abstract away the node graph -- power users can use seedling's `Connect`, `SamplerPool`, effects chains, and bus routing directly alongside `msg_seedling`.

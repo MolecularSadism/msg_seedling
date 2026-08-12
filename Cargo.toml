@@ -16,6 +16,7 @@ rand = ["dep:rand", "bevy_seedling/rand"]
 [dependencies]
 bevy = { version = "0.18", default-features = false, features = [
     "bevy_asset",
+    "bevy_log",
 ] }
 bevy_seedling = { version = "0.7", default-features = false, features = [
     "ogg",

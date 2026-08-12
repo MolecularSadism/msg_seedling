@@ -3,7 +3,7 @@ mod tests {
     use bevy::prelude::*;
 
     use crate::messages::{FadeAudio, PlayAudio, SpatialPosition, StopAudio};
-    use crate::randomization::{resolve_randomization, DefaultRandomization, Randomization};
+    use crate::randomization::{DefaultRandomization, Randomization, resolve_randomization};
     use crate::traits::{AudioCategory, AudioConfig};
 
     // -- Test types --
@@ -241,8 +241,7 @@ mod tests {
 
     #[test]
     fn play_audio_at_vec3() {
-        let msg =
-            PlayAudio::new(Handle::default(), TestSound::Sfx).at(Vec3::new(1.0, 2.0, 3.0));
+        let msg = PlayAudio::new(Handle::default(), TestSound::Sfx).at(Vec3::new(1.0, 2.0, 3.0));
         assert!(msg.position.is_some());
         let v3 = msg.position.unwrap().as_vec3();
         assert!((v3.z - 3.0).abs() < f32::EPSILON);
@@ -258,7 +257,9 @@ mod tests {
     fn play_audio_randomized() {
         let msg = PlayAudio::new(Handle::default(), TestSound::Sfx)
             .randomized(Randomization::Volume(0.3));
-        assert!(matches!(msg.randomization, Randomization::Volume(v) if (v - 0.3).abs() < f32::EPSILON));
+        assert!(
+            matches!(msg.randomization, Randomization::Volume(v) if (v - 0.3).abs() < f32::EPSILON)
+        );
     }
 
     #[test]
@@ -273,7 +274,9 @@ mod tests {
         assert!(msg.looping);
         assert!((msg.volume - 0.8).abs() < f32::EPSILON);
         assert_eq!(msg.parent, Some(entity));
-        assert!(matches!(msg.randomization, Randomization::Speed(s) if (s - 0.1).abs() < f32::EPSILON));
+        assert!(
+            matches!(msg.randomization, Randomization::Speed(s) if (s - 0.1).abs() < f32::EPSILON)
+        );
     }
 
     // -- StopAudio tests --
@@ -322,17 +325,68 @@ mod tests {
         app.add_plugins(MinimalPlugins);
         app.init_resource::<TestConfig>();
 
-        let plugin = crate::MsgSeedlingPlugin::<TestSound>::new()
-            .with_default_randomization(DefaultRandomization {
+        let plugin = crate::MsgSeedlingPlugin::<TestSound>::new().with_default_randomization(
+            DefaultRandomization {
                 volume: Some(0.1),
                 speed: None,
-            });
+            },
+        );
         app.add_plugins(plugin);
         app.update();
 
         let defaults = app.world().resource::<DefaultRandomization>();
         assert_eq!(defaults.volume, Some(0.1));
         assert_eq!(defaults.speed, None);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn plugin_enables_device_follow_by_default() {
+        use crate::FollowDefaultAudioDevice;
+
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins);
+        app.init_resource::<TestConfig>();
+        app.add_plugins(crate::MsgSeedlingPlugin::<TestSound>::default());
+        app.update();
+
+        let follow = app.world().resource::<FollowDefaultAudioDevice>();
+        assert_eq!(follow.poll_interval, core::time::Duration::from_secs(1));
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn plugin_without_device_follow_omits_resource() {
+        use crate::FollowDefaultAudioDevice;
+
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins);
+        app.init_resource::<TestConfig>();
+        app.add_plugins(crate::MsgSeedlingPlugin::<TestSound>::new().without_device_follow());
+        app.update();
+
+        assert!(!app.world().contains_resource::<FollowDefaultAudioDevice>());
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn plugin_custom_device_follow_interval() {
+        use crate::FollowDefaultAudioDevice;
+
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins);
+        app.init_resource::<TestConfig>();
+        app.add_plugins(
+            crate::MsgSeedlingPlugin::<TestSound>::new().with_device_follow(
+                FollowDefaultAudioDevice {
+                    poll_interval: core::time::Duration::from_millis(250),
+                },
+            ),
+        );
+        app.update();
+
+        let follow = app.world().resource::<FollowDefaultAudioDevice>();
+        assert_eq!(follow.poll_interval, core::time::Duration::from_millis(250));
     }
 
     // -- Randomization enum coverage --
@@ -351,8 +405,12 @@ mod tests {
         };
         let r2 = r;
         let r3 = r.clone();
-        assert!(matches!(r2, Randomization::VolumeAndSpeed { volume, speed } if (volume - 0.1).abs() < f32::EPSILON && (speed - 0.2).abs() < f32::EPSILON));
-        assert!(matches!(r3, Randomization::VolumeAndSpeed { volume, speed } if (volume - 0.1).abs() < f32::EPSILON && (speed - 0.2).abs() < f32::EPSILON));
+        assert!(
+            matches!(r2, Randomization::VolumeAndSpeed { volume, speed } if (volume - 0.1).abs() < f32::EPSILON && (speed - 0.2).abs() < f32::EPSILON)
+        );
+        assert!(
+            matches!(r3, Randomization::VolumeAndSpeed { volume, speed } if (volume - 0.1).abs() < f32::EPSILON && (speed - 0.2).abs() < f32::EPSILON)
+        );
     }
 
     #[test]

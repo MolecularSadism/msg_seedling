@@ -71,6 +71,8 @@
 //! }
 //! ```
 
+#[cfg(not(target_arch = "wasm32"))]
+mod device_follow;
 mod handlers;
 mod messages;
 mod randomization;
@@ -79,6 +81,8 @@ mod tests;
 mod traits;
 mod volume;
 
+#[cfg(not(target_arch = "wasm32"))]
+pub use device_follow::FollowDefaultAudioDevice;
 pub use messages::{FadeAudio, PlayAudio, SpatialPosition, StopAudio};
 pub use randomization::{DefaultRandomization, Randomization};
 pub use traits::{AudioCategory, AudioConfig};
@@ -116,6 +120,10 @@ use bevy_seedling::prelude::*;
 pub struct MsgSeedlingPlugin<C: AudioCategory> {
     default_randomization: DefaultRandomization,
     spatial_scale: Option<Vec3>,
+    /// `Some` = follow the OS default output device with this configuration.
+    /// Ignored on wasm, where the browser owns device routing.
+    #[cfg(not(target_arch = "wasm32"))]
+    device_follow: Option<FollowDefaultAudioDevice>,
     _phantom: std::marker::PhantomData<C>,
 }
 
@@ -124,6 +132,8 @@ impl<C: AudioCategory> Default for MsgSeedlingPlugin<C> {
         Self {
             default_randomization: DefaultRandomization::default(),
             spatial_scale: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            device_follow: Some(FollowDefaultAudioDevice::default()),
             _phantom: std::marker::PhantomData,
         }
     }
@@ -150,6 +160,29 @@ impl<C: AudioCategory> MsgSeedlingPlugin<C> {
     #[must_use]
     pub fn with_spatial_scale(mut self, scale: Vec3) -> Self {
         self.spatial_scale = Some(scale);
+        self
+    }
+
+    /// Configures how the OS default output device is followed.
+    ///
+    /// Following is enabled by default with a one-second poll interval; use
+    /// this to change the interval. No effect on wasm.
+    #[must_use]
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn with_device_follow(mut self, settings: FollowDefaultAudioDevice) -> Self {
+        self.device_follow = Some(settings);
+        self
+    }
+
+    /// Disables following the OS default output device.
+    ///
+    /// The stream then stays on the device it was opened with until it fails
+    /// (`bevy_seedling` still recovers from outright device loss). No effect
+    /// on wasm.
+    #[must_use]
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn without_device_follow(mut self) -> Self {
+        self.device_follow = None;
         self
     }
 }
@@ -179,6 +212,28 @@ impl<C: AudioCategory> Plugin for MsgSeedlingPlugin<C> {
                 volume::update_category_volumes::<C>.run_if(resource_changed::<C::Config>),
             ),
         );
+
+        // Follow the OS default output device (native only)
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            use bevy_seedling::context::{AudioContext, AudioStreamConfig};
+
+            app.register_type::<FollowDefaultAudioDevice>();
+            app.init_resource::<device_follow::FollowDefaultState>();
+            if let Some(settings) = self.device_follow.clone() {
+                app.insert_resource(settings);
+            }
+            app.add_systems(
+                Update,
+                device_follow::follow_default_device.run_if(
+                    resource_exists::<FollowDefaultAudioDevice>
+                        .and(resource_exists::<AudioContext>)
+                        .and(resource_exists::<AudioStreamConfig>),
+                ),
+            );
+            app.add_observer(device_follow::resync_on_stream_start);
+            app.add_observer(device_follow::resync_on_stream_restart);
+        }
     }
 }
 
@@ -190,10 +245,12 @@ pub mod audio_systems {
 
 /// Prelude module for convenient imports.
 pub mod prelude {
+    pub use crate::MsgSeedlingPlugin;
+    #[cfg(not(target_arch = "wasm32"))]
+    pub use crate::device_follow::FollowDefaultAudioDevice;
     pub use crate::messages::{FadeAudio, PlayAudio, SpatialPosition, StopAudio};
     pub use crate::randomization::{DefaultRandomization, Randomization};
     pub use crate::traits::{AudioCategory, AudioConfig};
-    pub use crate::MsgSeedlingPlugin;
 
     // Re-export commonly needed seedling types
     pub use bevy_seedling::prelude::{
