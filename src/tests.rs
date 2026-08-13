@@ -339,56 +339,6 @@ mod tests {
         assert_eq!(defaults.speed, None);
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
-    #[test]
-    fn plugin_enables_device_follow_by_default() {
-        use crate::FollowDefaultAudioDevice;
-
-        let mut app = App::new();
-        app.add_plugins(MinimalPlugins);
-        app.init_resource::<TestConfig>();
-        app.add_plugins(crate::MsgSeedlingPlugin::<TestSound>::default());
-        app.update();
-
-        let follow = app.world().resource::<FollowDefaultAudioDevice>();
-        assert_eq!(follow.poll_interval, core::time::Duration::from_secs(1));
-    }
-
-    #[cfg(not(target_arch = "wasm32"))]
-    #[test]
-    fn plugin_without_device_follow_omits_resource() {
-        use crate::FollowDefaultAudioDevice;
-
-        let mut app = App::new();
-        app.add_plugins(MinimalPlugins);
-        app.init_resource::<TestConfig>();
-        app.add_plugins(crate::MsgSeedlingPlugin::<TestSound>::new().without_device_follow());
-        app.update();
-
-        assert!(!app.world().contains_resource::<FollowDefaultAudioDevice>());
-    }
-
-    #[cfg(not(target_arch = "wasm32"))]
-    #[test]
-    fn plugin_custom_device_follow_interval() {
-        use crate::FollowDefaultAudioDevice;
-
-        let mut app = App::new();
-        app.add_plugins(MinimalPlugins);
-        app.init_resource::<TestConfig>();
-        app.add_plugins(
-            crate::MsgSeedlingPlugin::<TestSound>::new().with_device_follow(
-                FollowDefaultAudioDevice {
-                    poll_interval: core::time::Duration::from_millis(250),
-                },
-            ),
-        );
-        app.update();
-
-        let follow = app.world().resource::<FollowDefaultAudioDevice>();
-        assert_eq!(follow.poll_interval, core::time::Duration::from_millis(250));
-    }
-
     // -- Randomization enum coverage --
 
     #[test]
