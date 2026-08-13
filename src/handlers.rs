@@ -2,7 +2,7 @@ use bevy::prelude::*;
 use bevy_seedling::prelude::*;
 
 use crate::messages::{FadeAudio, PlayAudio, StopAudio};
-use crate::randomization::{resolve_randomization, DefaultRandomization};
+use crate::randomization::{DefaultRandomization, resolve_randomization};
 use crate::traits::AudioCategory;
 
 /// System that handles [`PlayAudio`] messages by spawning seedling `SamplePlayer` entities.
