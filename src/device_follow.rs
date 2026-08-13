@@ -9,16 +9,46 @@
 //! goes unnoticed.
 //!
 //! This module polls the default output device on an interval and, when it
-//! changes while the stream config does not pin a specific device, forces a
-//! stream restart. With no pinned device, the restarted stream opens whatever
-//! the OS now reports as the default output.
+//! changes while the stream config does not pin a specific device, asks
+//! `bevy_seedling` to restart the stream. With no pinned device, the restarted
+//! stream opens whatever the OS now reports as the default output.
+//!
+//! This is a standalone plugin, independent of [`MsgSeedlingPlugin`] and of
+//! the audio category type: add it once, however many category types the app
+//! uses.
+//!
+//! ```rust,ignore
+//! app.add_plugins(msg_seedling::device_follow::plugin);
+//! ```
+//!
+//! [`MsgSeedlingPlugin`]: crate::MsgSeedlingPlugin
 
 use bevy::prelude::*;
-use bevy_seedling::configuration::FetchAudioIoEvent;
+use bevy_seedling::configuration::{FetchAudioIoEvent, RestartAudioEvent};
 use bevy_seedling::context::{
     AudioContext, AudioStreamConfig, StreamRestartEvent, StreamStartEvent,
 };
 use core::time::Duration;
+
+/// Adds OS default-output-device following.
+///
+/// Insert or remove [`FollowDefaultAudioDevice`] to toggle the behavior at
+/// runtime; the resource is inserted here with its default poll interval.
+pub fn plugin(app: &mut App) {
+    app.register_type::<FollowDefaultAudioDevice>();
+    app.init_resource::<FollowDefaultAudioDevice>();
+    app.init_resource::<FollowDefaultState>();
+    app.add_systems(
+        Update,
+        follow_default_device.run_if(
+            resource_exists::<FollowDefaultAudioDevice>
+                .and(resource_exists::<AudioContext>)
+                .and(resource_exists::<AudioStreamConfig>),
+        ),
+    );
+    app.add_observer(resync_on_stream_start);
+    app.add_observer(resync_on_stream_restart);
+}
 
 /// Enables following the operating system's default audio output device.
 ///
@@ -32,7 +62,8 @@ pub struct FollowDefaultAudioDevice {
     /// How often to check which output device the OS considers the default.
     ///
     /// Each check enumerates the host's audio devices, so keep this in the
-    /// hundreds of milliseconds or above.
+    /// hundreds of milliseconds or above. Changing it retimes the poll on the
+    /// next run.
     pub poll_interval: Duration,
 }
 
@@ -44,12 +75,24 @@ impl Default for FollowDefaultAudioDevice {
     }
 }
 
-/// Internal polling state: accumulated time since the last check and the
-/// last-observed default output device id.
-#[derive(Resource, Debug, Default)]
-pub(crate) struct FollowDefaultState {
-    elapsed: Duration,
+/// Internal polling state: the poll timer and the last-observed default
+/// output device id.
+#[derive(Resource, Debug)]
+struct FollowDefaultState {
+    timer: Timer,
     last_default: Option<String>,
+}
+
+impl Default for FollowDefaultState {
+    fn default() -> Self {
+        Self {
+            timer: Timer::new(
+                FollowDefaultAudioDevice::default().poll_interval,
+                TimerMode::Repeating,
+            ),
+            last_default: None,
+        }
+    }
 }
 
 /// The id of the device the OS currently reports as the default output.
@@ -66,40 +109,63 @@ fn current_default(context: &mut AudioContext) -> Option<String> {
 }
 
 /// Polls the OS default output device and restarts the stream when it moves.
-pub(crate) fn follow_default_device(
+fn follow_default_device(
     time: Res<Time>,
     settings: Res<FollowDefaultAudioDevice>,
     mut state: ResMut<FollowDefaultState>,
     mut context: ResMut<AudioContext>,
-    mut config: ResMut<AudioStreamConfig>,
+    config: Res<AudioStreamConfig>,
     mut commands: Commands,
 ) {
-    state.elapsed += time.delta();
-    if state.elapsed < settings.poll_interval {
-        return;
-    }
-    state.elapsed = Duration::ZERO;
+    let state = &mut *state;
 
-    // A pinned device is an explicit choice; never override it.
-    if config.0.output.device_id.is_some() {
+    if state.timer.duration() != settings.poll_interval {
+        state.timer.set_duration(settings.poll_interval);
+    }
+    if !state.timer.tick(time.delta()).just_finished() {
         return;
     }
 
-    let current = current_default(&mut context);
-    if default_changed(&mut state.last_default, current) {
+    let restart_needed = restart_needed(
+        config.0.output.device_id.is_some(),
+        &mut state.last_default,
+        || current_default(&mut context),
+    );
+
+    if restart_needed {
         bevy::log::info!("System default audio output changed; restarting audio stream.");
+        // Refresh the device entities first: `RestartAudioEvent`'s observer
+        // reads them to re-select a device when the configured one is gone.
         commands.trigger(FetchAudioIoEvent);
-        // Touching the config restarts the stream; with no pinned device the
-        // new stream opens the OS's current default output.
-        config.set_changed();
+        commands.trigger(RestartAudioEvent);
     }
+}
+
+/// Whether the OS default having moved warrants a stream restart.
+///
+/// `enumerate` yields the id the OS currently reports as its default output.
+/// It is only called when no device is pinned, so a pinned configuration
+/// costs no device enumeration at all.
+///
+/// A pinned device is a deliberate choice and is never overridden: the cache
+/// is left untouched while one is set, and the resync observers reseed it
+/// whenever the stream next starts or restarts.
+fn restart_needed(
+    pinned: bool,
+    last_default: &mut Option<String>,
+    enumerate: impl FnOnce() -> Option<String>,
+) -> bool {
+    if pinned {
+        return false;
+    }
+    default_changed(last_default, enumerate())
 }
 
 /// Records the default device the stream just started on, so a restart
 /// initiated elsewhere (initial startup, or `bevy_seedling`'s own recovery
 /// after a device disappears) is not followed by a second, redundant restart
 /// from the poller.
-pub(crate) fn resync_on_stream_start(
+fn resync_on_stream_start(
     _: On<StreamStartEvent>,
     mut state: ResMut<FollowDefaultState>,
     mut context: ResMut<AudioContext>,
@@ -108,7 +174,7 @@ pub(crate) fn resync_on_stream_start(
 }
 
 /// See [`resync_on_stream_start`].
-pub(crate) fn resync_on_stream_restart(
+fn resync_on_stream_restart(
     _: On<StreamRestartEvent>,
     mut state: ResMut<FollowDefaultState>,
     mut context: ResMut<AudioContext>,
@@ -141,6 +207,7 @@ fn default_changed(last: &mut Option<String>, current: Option<String>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use core::cell::Cell;
 
     #[test]
     fn first_observation_seeds_without_restart() {
@@ -172,5 +239,48 @@ mod tests {
         let mut empty = None;
         assert!(!default_changed(&mut empty, None));
         assert_eq!(empty, None);
+    }
+
+    #[test]
+    fn a_pinned_device_is_never_overridden() {
+        let mut last = Some(String::from("speakers"));
+        let enumerated = Cell::new(false);
+
+        let restart = restart_needed(true, &mut last, || {
+            enumerated.set(true);
+            Some(String::from("headphones"))
+        });
+
+        assert!(!restart, "a pinned device must not trigger a restart");
+        assert!(
+            !enumerated.get(),
+            "a pinned device must not cost a device enumeration"
+        );
+        assert_eq!(
+            last.as_deref(),
+            Some("speakers"),
+            "the cache is left for the resync observers to reseed"
+        );
+    }
+
+    #[test]
+    fn an_unpinned_device_follows_the_os_default() {
+        let mut last = Some(String::from("speakers"));
+        let restart = restart_needed(false, &mut last, || Some(String::from("headphones")));
+
+        assert!(restart);
+        assert_eq!(last.as_deref(), Some("headphones"));
+    }
+
+    #[test]
+    fn the_poll_timer_repeats_at_the_configured_interval() {
+        let mut state = FollowDefaultState::default();
+        assert_eq!(state.timer.mode(), TimerMode::Repeating);
+
+        state.timer.set_duration(Duration::from_millis(500));
+        assert!(!state.timer.tick(Duration::from_millis(300)).just_finished());
+        assert!(state.timer.tick(Duration::from_millis(300)).just_finished());
+        assert!(!state.timer.tick(Duration::from_millis(100)).just_finished());
+        assert!(state.timer.tick(Duration::from_millis(500)).just_finished());
     }
 }

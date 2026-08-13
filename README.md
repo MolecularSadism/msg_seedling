@@ -186,25 +186,28 @@ stream when it errors out (device removed). So switching the system default
 output — without the old device disappearing — would leave audio playing on
 the old device.
 
-On native targets, `MsgSeedlingPlugin` therefore polls the OS default output
-device (every second by default) and restarts the stream when it changes,
-as long as `AudioStreamConfig` does not pin a specific output device. A pinned
-device is always respected. On wasm the browser owns device routing, so this
-does nothing there.
+On native targets, `device_follow::plugin` polls the OS default output device
+(every second by default) and asks `bevy_seedling` to restart the stream when
+it changes, as long as `AudioStreamConfig` does not pin a specific output
+device. A pinned device is always respected, and costs no device enumeration.
+
+This is a standalone, optional plugin: it has nothing to do with audio
+categories, so it is not part of `MsgSeedlingPlugin<C>` and is added once
+regardless of how many category types the app uses. On wasm the browser owns
+device routing, so the module is not compiled there.
 
 ```rust
-// Change the poll interval
-MsgSeedlingPlugin::<Sound>::new()
-    .with_device_follow(FollowDefaultAudioDevice {
-        poll_interval: Duration::from_millis(500),
-    })
-
-// Or opt out entirely
-MsgSeedlingPlugin::<Sound>::new().without_device_follow()
+app.add_plugins(msg_seedling::device_follow::plugin);
 ```
 
-At runtime, remove or insert the `FollowDefaultAudioDevice` resource to toggle
-the behavior.
+Insert or remove the `FollowDefaultAudioDevice` resource to toggle the
+behavior at runtime, or set its `poll_interval` to retime the poll:
+
+```rust
+commands.insert_resource(FollowDefaultAudioDevice {
+    poll_interval: Duration::from_millis(500),
+});
+```
 
 ## Architecture
 
