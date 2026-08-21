@@ -335,6 +335,77 @@ fn plugin_custom_randomization() {
     assert_eq!(defaults.speed, None);
 }
 
+// -- Category volume update tests --
+
+mod category_volume_updates {
+    use core::time::Duration;
+
+    use bevy_seedling::prelude::*;
+
+    use super::*;
+    use crate::fade::{FadeInAudio, FadeOutAudio};
+
+    fn volume_app() -> App {
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins);
+        app.init_resource::<TestConfig>();
+        app.add_plugins(crate::MsgSeedlingPlugin::<TestSound>::default());
+        // Flush the initial resource-changed run before spawning samples.
+        app.update();
+        app
+    }
+
+    fn spawn_sample(app: &mut App, extra: impl Bundle) -> Entity {
+        app.world_mut()
+            .spawn((
+                TestSound::Sfx,
+                sample_effects![VolumeNode::from_linear(0.4)],
+                extra,
+            ))
+            .id()
+    }
+
+    fn effect_volume(world: &World, entity: Entity) -> f32 {
+        let effects = world.get::<SampleEffects>(entity).expect("sample effects");
+        let node = effects
+            .iter()
+            .find_map(|effect| world.get::<VolumeNode>(effect))
+            .expect("volume node effect");
+        node.volume.linear()
+    }
+
+    #[test]
+    fn config_change_updates_steady_samples() {
+        let mut app = volume_app();
+        let steady = spawn_sample(&mut app, ());
+
+        app.world_mut().resource_mut::<TestConfig>().sfx = 0.9;
+        app.update();
+
+        assert!((effect_volume(app.world(), steady) - 0.9).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn config_change_leaves_fading_samples_untouched() {
+        let mut app = volume_app();
+        let fading_out = spawn_sample(
+            &mut app,
+            FadeOutAudio::new(Duration::from_secs(1)).keep_entity(),
+        );
+        let fading_in = spawn_sample(&mut app, FadeInAudio::new(Duration::from_secs(1), 1.0));
+        let steady = spawn_sample(&mut app, ());
+
+        app.world_mut().resource_mut::<TestConfig>().sfx = 0.9;
+        app.update();
+
+        // The fades own their volume nodes; only the steady sample follows
+        // the config change.
+        assert!((effect_volume(app.world(), fading_out) - 0.4).abs() < f32::EPSILON);
+        assert!((effect_volume(app.world(), fading_in) - 0.4).abs() < f32::EPSILON);
+        assert!((effect_volume(app.world(), steady) - 0.9).abs() < f32::EPSILON);
+    }
+}
+
 // -- Randomization enum coverage --
 
 #[test]
