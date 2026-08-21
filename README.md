@@ -334,6 +334,7 @@ and `PlayQueuedAudio` (see "Virtual Voice Queue" above).
 
 | msg_seedling | bevy_seedling | Bevy |
 |-------------|---------------|------|
+| 0.3         | 0.7           | 0.18 |
 | 0.2         | 0.7           | 0.18 |
 | 0.1         | 0.7           | 0.18 |
 
