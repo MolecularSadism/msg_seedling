@@ -3,7 +3,10 @@ use bevy::prelude::*;
 /// Base trait for audio categories that provide volume multipliers.
 ///
 /// Games implement this for their own audio category enum. Each variant
-/// maps to a volume level from the configuration resource.
+/// maps to a volume level from the configuration resource. Categories must
+/// derive `Reflect` so components generic over them (e.g.
+/// [`VirtualSound`](crate::virtual_queue::VirtualSound)) can be registered
+/// for reflection.
 ///
 /// # Example
 ///
@@ -39,6 +42,8 @@ pub trait AudioCategory:
     + PartialEq
     + Eq
     + std::hash::Hash
+    + bevy::reflect::Reflectable
+    + FromReflect
     + Send
     + Sync
     + 'static

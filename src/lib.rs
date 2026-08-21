@@ -99,8 +99,8 @@ pub use messages::{FadeAudio, PlayAudio, SpatialPosition, StopAudio};
 pub use randomization::{DefaultRandomization, Randomization};
 pub use traits::{AudioCategory, AudioConfig};
 pub use virtual_queue::{
-    Audible, PlayQueuedAudio, Retiring, SignificanceEntry, VirtualSound, VirtualVoiceBudget,
-    VirtualVoiceQueuePlugin, VoiceDecision, rank_by_significance,
+    Audible, PlayQueuedAudio, Retiring, SignificanceEntry, StopQueuedAudio, VirtualSound,
+    VirtualVoiceBudget, VirtualVoiceQueuePlugin, VoiceDecision, rank_by_significance,
 };
 
 use bevy::prelude::*;
@@ -218,7 +218,7 @@ pub mod prelude {
     pub use crate::randomization::{DefaultRandomization, Randomization};
     pub use crate::traits::{AudioCategory, AudioConfig};
     pub use crate::virtual_queue::{
-        Audible, PlayQueuedAudio, Retiring, VirtualSound, VirtualVoiceBudget,
+        Audible, PlayQueuedAudio, Retiring, StopQueuedAudio, VirtualSound, VirtualVoiceBudget,
         VirtualVoiceQueuePlugin,
     };
 

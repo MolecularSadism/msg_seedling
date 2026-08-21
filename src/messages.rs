@@ -4,7 +4,7 @@ use crate::randomization::Randomization;
 use crate::traits::AudioCategory;
 
 /// Spatial positioning for audio.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Reflect)]
 pub enum SpatialPosition {
     Vec2(Vec2),
     Vec3(Vec3),
