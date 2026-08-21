@@ -40,22 +40,43 @@ impl SpatialPosition {
 ///
 /// # Examples
 ///
-/// ```rust,ignore
-/// // One-shot with plugin default randomization
-/// writer.write(PlayAudio::new(handle.clone(), Sound::Sfx));
+/// ```
+/// # use bevy::prelude::*;
+/// # use msg_seedling::prelude::*;
+/// # #[derive(Component, Clone, Copy, Default, Debug, PartialEq, Eq, Hash, Reflect)]
+/// # #[reflect(Component)]
+/// # enum Sound { #[default] Sfx, Music }
+/// # #[derive(Resource, Clone, Default)]
+/// # struct Settings;
+/// # impl AudioConfig for Settings { fn master_volume(&self) -> f32 { 1.0 } }
+/// # impl AudioCategory for Sound {
+/// #     type Config = Settings;
+/// #     fn volume(&self, _config: &Settings) -> f32 { 1.0 }
+/// # }
+/// fn play_sounds(mut writer: MessageWriter<PlayAudio<Sound>>) {
+///     # let handle: Handle<AudioSample> = Handle::default();
+///     # let entity = Entity::from_bits(1);
+///     // One-shot with plugin default randomization
+///     writer.write(PlayAudio::new(handle.clone(), Sound::Sfx));
 ///
-/// // Looping music, exact playback
-/// writer.write(
-///     PlayAudio::new(handle.clone(), Sound::Music)
-///         .looping()
-///         .randomized(Randomization::VolumeAndSpeed { volume: 0.0, speed: 0.0 })
-/// );
+///     // Looping music, exact playback
+///     writer.write(
+///         PlayAudio::new(handle.clone(), Sound::Music)
+///             .looping()
+///             .randomized(Randomization::VolumeAndSpeed { volume: 0.0, speed: 0.0 })
+///     );
 ///
-/// // Spatial, attached to entity
-/// writer.write(PlayAudio::new(handle.clone(), Sound::Sfx).with_parent(entity));
+///     // Spatial, attached to entity
+///     writer.write(PlayAudio::new(handle.clone(), Sound::Sfx).with_parent(entity));
 ///
-/// // Spatial at world position
-/// writer.write(PlayAudio::new(handle, Sound::Sfx).at(Vec2::new(100.0, 50.0)));
+///     // Spatial at world position
+///     writer.write(PlayAudio::new(handle, Sound::Sfx).at(Vec2::new(100.0, 50.0)));
+/// }
+/// # let mut app = App::new();
+/// # app.add_plugins(MinimalPlugins);
+/// # app.add_message::<PlayAudio<Sound>>();
+/// # app.add_systems(Update, play_sounds);
+/// # app.update();
 /// ```
 #[derive(Message, Clone)]
 pub struct PlayAudio<C: AudioCategory> {
@@ -132,12 +153,31 @@ impl<C: AudioCategory> PlayAudio<C> {
 ///
 /// # Examples
 ///
-/// ```rust,ignore
-/// // Stop all music
-/// writer.write(StopAudio::category(Sound::Music));
+/// ```
+/// # use bevy::prelude::*;
+/// # use msg_seedling::prelude::*;
+/// # #[derive(Component, Clone, Copy, Default, Debug, PartialEq, Eq, Hash, Reflect)]
+/// # #[reflect(Component)]
+/// # enum Sound { #[default] Sfx, Music }
+/// # #[derive(Resource, Clone, Default)]
+/// # struct Settings;
+/// # impl AudioConfig for Settings { fn master_volume(&self) -> f32 { 1.0 } }
+/// # impl AudioCategory for Sound {
+/// #     type Config = Settings;
+/// #     fn volume(&self, _config: &Settings) -> f32 { 1.0 }
+/// # }
+/// fn stop_sounds(mut writer: MessageWriter<StopAudio<Sound>>) {
+///     // Stop all music
+///     writer.write(StopAudio::category(Sound::Music));
 ///
-/// // Stop everything
-/// writer.write(StopAudio::<Sound>::all());
+///     // Stop everything
+///     writer.write(StopAudio::<Sound>::all());
+/// }
+/// # let mut app = App::new();
+/// # app.add_plugins(MinimalPlugins);
+/// # app.add_message::<StopAudio<Sound>>();
+/// # app.add_systems(Update, stop_sounds);
+/// # app.update();
 /// ```
 #[derive(Message, Clone)]
 pub struct StopAudio<C: AudioCategory> {
@@ -167,8 +207,27 @@ impl<C: AudioCategory> StopAudio<C> {
 ///
 /// # Examples
 ///
-/// ```rust,ignore
-/// writer.write(FadeAudio::new(Sound::Music, 2.0));
+/// ```
+/// # use bevy::prelude::*;
+/// # use msg_seedling::prelude::*;
+/// # #[derive(Component, Clone, Copy, Default, Debug, PartialEq, Eq, Hash, Reflect)]
+/// # #[reflect(Component)]
+/// # enum Sound { #[default] Sfx, Music }
+/// # #[derive(Resource, Clone, Default)]
+/// # struct Settings;
+/// # impl AudioConfig for Settings { fn master_volume(&self) -> f32 { 1.0 } }
+/// # impl AudioCategory for Sound {
+/// #     type Config = Settings;
+/// #     fn volume(&self, _config: &Settings) -> f32 { 1.0 }
+/// # }
+/// fn fade_music(mut writer: MessageWriter<FadeAudio<Sound>>) {
+///     writer.write(FadeAudio::new(Sound::Music, 2.0));
+/// }
+/// # let mut app = App::new();
+/// # app.add_plugins(MinimalPlugins);
+/// # app.add_message::<FadeAudio<Sound>>();
+/// # app.add_systems(Update, fade_music);
+/// # app.update();
 /// ```
 #[derive(Message, Clone)]
 pub struct FadeAudio<C: AudioCategory> {

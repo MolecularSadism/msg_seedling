@@ -17,8 +17,12 @@
 //! the audio category type: add it once, however many category types the app
 //! uses.
 //!
-//! ```rust,ignore
+//! ```
+//! # use bevy::prelude::*;
+//! # let mut app = App::new();
+//! # app.add_plugins(MinimalPlugins);
 //! app.add_plugins(msg_seedling::device_follow::plugin);
+//! # app.update();
 //! ```
 //!
 //! [`MsgSeedlingPlugin`]: crate::MsgSeedlingPlugin
