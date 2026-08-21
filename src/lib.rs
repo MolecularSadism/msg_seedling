@@ -99,7 +99,8 @@ pub use messages::{FadeAudio, PlayAudio, SpatialPosition, StopAudio};
 pub use randomization::{DefaultRandomization, Randomization};
 pub use traits::{AudioCategory, AudioConfig};
 pub use virtual_queue::{
-    Audible, PlayQueuedAudio, Retiring, VirtualSound, VirtualVoiceBudget, VirtualVoiceQueuePlugin,
+    Audible, PlayQueuedAudio, Retiring, SignificanceEntry, VirtualSound, VirtualVoiceBudget,
+    VirtualVoiceQueuePlugin, VoiceDecision, rank_by_significance,
 };
 
 use bevy::prelude::*;

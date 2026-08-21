@@ -294,33 +294,54 @@ fn enqueue_queued_audio<C: AudioCategory>(
     }
 }
 
-/// One queue entry's ranking inputs.
+/// One queue entry's ranking inputs, for [`rank_by_significance`].
 #[derive(Clone, Copy, Debug)]
-struct Entry {
-    entity: Entity,
-    significance: f32,
-    audible: bool,
+pub struct SignificanceEntry {
+    pub entity: Entity,
+    pub significance: f32,
+    pub audible: bool,
 }
 
+/// What [`rank_by_significance`] decided an entry should do.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Decision {
+pub enum VoiceDecision {
+    /// Give this virtual entry a real voice — it ranks in the top
+    /// `max_audible`, and doesn't have one yet.
     Promote,
+    /// Take this entry's real voice away — it no longer ranks in the top
+    /// `max_audible`, but currently has one.
     Demote,
+    /// No change: either already in the right state, or still waiting for a
+    /// slot to open up.
     Hold,
 }
 
-/// Pure ranking decision: given every non-retiring entry and however many
-/// voices are already retiring (still occupying a real voice mid-fade-out),
-/// decides which entries should hold a real voice.
+/// Pure ranking decision, exposed for callers who need their own promotion
+/// target — a custom sampler pool, a custom effects chain (e.g. one with a
+/// low-pass filter for muffling) — rather than [`VirtualVoiceQueuePlugin`]'s
+/// built-in `SpatialPool`/`DefaultPool` routing. Combine with
+/// [`crate::fade::FadeInAudio`]/[`crate::fade::FadeOutAudio`] (pool-agnostic
+/// themselves — they only need `SampleEffects`) to get the same
+/// promote/demote crossfade behavior on top of any pool.
+///
+/// Given every non-retiring entry and however many voices are already
+/// retiring (still occupying a real voice mid-fade-out), decides which
+/// entries should hold a real voice.
 ///
 /// Entries are ranked by `significance` descending; the top `max_audible`
 /// (after reserving `retiring` slots for fades already in flight) are
-/// [`Decision::Promote`]d if virtual or held if already audible, and the
-/// rest are [`Decision::Demote`]d if audible or held (still waiting) if
-/// virtual. Ties keep their input order, so equally significant requests
-/// resolve deterministically by arrival order rather than by chance.
-fn rank(entries: &[Entry], max_audible: usize, retiring: usize) -> Vec<(Entity, Decision)> {
-    let mut ranked: Vec<&Entry> = entries.iter().collect();
+/// [`VoiceDecision::Promote`]d if virtual or held if already audible, and
+/// the rest are [`VoiceDecision::Demote`]d if audible or held (still
+/// waiting) if virtual. Ties keep their input order, so equally significant
+/// requests resolve deterministically by arrival order rather than by
+/// chance.
+#[must_use]
+pub fn rank_by_significance(
+    entries: &[SignificanceEntry],
+    max_audible: usize,
+    retiring: usize,
+) -> Vec<(Entity, VoiceDecision)> {
+    let mut ranked: Vec<&SignificanceEntry> = entries.iter().collect();
     ranked.sort_by(|a, b| {
         b.significance
             .partial_cmp(&a.significance)
@@ -334,14 +355,14 @@ fn rank(entries: &[Entry], max_audible: usize, retiring: usize) -> Vec<(Entity, 
             let decision = if used < max_audible {
                 used += 1;
                 if entry.audible {
-                    Decision::Hold
+                    VoiceDecision::Hold
                 } else {
-                    Decision::Promote
+                    VoiceDecision::Promote
                 }
             } else if entry.audible {
-                Decision::Demote
+                VoiceDecision::Demote
             } else {
-                Decision::Hold
+                VoiceDecision::Hold
             };
             (entry.entity, decision)
         })
@@ -358,9 +379,9 @@ fn rank_virtual_voices<C: AudioCategory>(
 ) {
     let retiring_count = retiring.iter().count();
 
-    let entries: Vec<Entry> = eligible
+    let entries: Vec<SignificanceEntry> = eligible
         .iter()
-        .map(|(entity, sound, audible)| Entry {
+        .map(|(entity, sound, audible)| SignificanceEntry {
             entity,
             significance: sound.target_volume * sound.priority,
             audible,
@@ -371,15 +392,16 @@ fn rank_virtual_voices<C: AudioCategory>(
         return;
     }
 
-    let decisions: HashMap<Entity, Decision> = rank(&entries, budget.max_audible, retiring_count)
-        .into_iter()
-        .collect();
+    let decisions: HashMap<Entity, VoiceDecision> =
+        rank_by_significance(&entries, budget.max_audible, retiring_count)
+            .into_iter()
+            .collect();
 
     let now = time.elapsed();
 
     for entry in &entries {
         match decisions.get(&entry.entity) {
-            Some(Decision::Promote) => {
+            Some(VoiceDecision::Promote) => {
                 let Ok((_, sound, _)) = eligible.get(entry.entity) else {
                     continue;
                 };
@@ -413,13 +435,13 @@ fn rank_virtual_voices<C: AudioCategory>(
                     ec.insert(Transform::from_translation(position.as_vec3()));
                 }
             }
-            Some(Decision::Demote) => {
+            Some(VoiceDecision::Demote) => {
                 commands
                     .entity(entry.entity)
                     .remove::<Audible>()
                     .insert((Retiring, FadeOutAudio::new(budget.crossfade)));
             }
-            Some(Decision::Hold) | None => {
+            Some(VoiceDecision::Hold) | None => {
                 if !entry.audible
                     && let Ok((_, sound, _)) = eligible.get(entry.entity)
                     && now.saturating_sub(sound.requested_at) > budget.max_wait
@@ -440,8 +462,8 @@ mod tests {
         Entity::from_raw_u32(id).expect("test id is a valid entity index")
     }
 
-    fn entry(id: u32, significance: f32, audible: bool) -> Entry {
-        Entry {
+    fn entry(id: u32, significance: f32, audible: bool) -> SignificanceEntry {
+        SignificanceEntry {
             entity: eid(id),
             significance,
             audible,
@@ -455,11 +477,11 @@ mod tests {
             entry(1, 0.5, false),
             entry(2, 0.8, false),
         ];
-        let decisions: HashMap<_, _> = rank(&entries, 2, 0).into_iter().collect();
+        let decisions: HashMap<_, _> = rank_by_significance(&entries, 2, 0).into_iter().collect();
 
-        assert_eq!(decisions[&eid(0)], Decision::Promote);
-        assert_eq!(decisions[&eid(2)], Decision::Promote);
-        assert_eq!(decisions[&eid(1)], Decision::Hold);
+        assert_eq!(decisions[&eid(0)], VoiceDecision::Promote);
+        assert_eq!(decisions[&eid(2)], VoiceDecision::Promote);
+        assert_eq!(decisions[&eid(1)], VoiceDecision::Hold);
     }
 
     #[test]
@@ -469,11 +491,11 @@ mod tests {
             entry(1, 0.2, true),  // audible, weakest
             entry(2, 1.0, false), // new, most significant
         ];
-        let decisions: HashMap<_, _> = rank(&entries, 2, 0).into_iter().collect();
+        let decisions: HashMap<_, _> = rank_by_significance(&entries, 2, 0).into_iter().collect();
 
-        assert_eq!(decisions[&eid(2)], Decision::Promote);
-        assert_eq!(decisions[&eid(0)], Decision::Hold);
-        assert_eq!(decisions[&eid(1)], Decision::Demote);
+        assert_eq!(decisions[&eid(2)], VoiceDecision::Promote);
+        assert_eq!(decisions[&eid(0)], VoiceDecision::Hold);
+        assert_eq!(decisions[&eid(1)], VoiceDecision::Demote);
     }
 
     #[test]
@@ -483,11 +505,11 @@ mod tests {
             entry(1, 0.7, true),
             entry(2, 0.1, false), // new, weakest
         ];
-        let decisions: HashMap<_, _> = rank(&entries, 2, 0).into_iter().collect();
+        let decisions: HashMap<_, _> = rank_by_significance(&entries, 2, 0).into_iter().collect();
 
-        assert_eq!(decisions[&eid(0)], Decision::Hold);
-        assert_eq!(decisions[&eid(1)], Decision::Hold);
-        assert_eq!(decisions[&eid(2)], Decision::Hold);
+        assert_eq!(decisions[&eid(0)], VoiceDecision::Hold);
+        assert_eq!(decisions[&eid(1)], VoiceDecision::Hold);
+        assert_eq!(decisions[&eid(2)], VoiceDecision::Hold);
     }
 
     #[test]
@@ -495,10 +517,10 @@ mod tests {
         // Budget of 2, but one voice is already retiring (mid fade-out) —
         // only one new promotion should fit until it's gone.
         let entries = [entry(0, 1.0, false), entry(1, 0.9, false)];
-        let decisions: HashMap<_, _> = rank(&entries, 2, 1).into_iter().collect();
+        let decisions: HashMap<_, _> = rank_by_significance(&entries, 2, 1).into_iter().collect();
 
-        assert_eq!(decisions[&eid(0)], Decision::Promote);
-        assert_eq!(decisions[&eid(1)], Decision::Hold);
+        assert_eq!(decisions[&eid(0)], VoiceDecision::Promote);
+        assert_eq!(decisions[&eid(1)], VoiceDecision::Hold);
     }
 
     #[test]
@@ -508,20 +530,20 @@ mod tests {
             entry(1, 0.5, false),
             entry(2, 0.5, false),
         ];
-        let decisions: HashMap<_, _> = rank(&entries, 2, 0).into_iter().collect();
+        let decisions: HashMap<_, _> = rank_by_significance(&entries, 2, 0).into_iter().collect();
 
-        assert_eq!(decisions[&eid(0)], Decision::Promote);
-        assert_eq!(decisions[&eid(1)], Decision::Promote);
-        assert_eq!(decisions[&eid(2)], Decision::Hold);
+        assert_eq!(decisions[&eid(0)], VoiceDecision::Promote);
+        assert_eq!(decisions[&eid(1)], VoiceDecision::Promote);
+        assert_eq!(decisions[&eid(2)], VoiceDecision::Hold);
     }
 
     #[test]
     fn zero_budget_holds_or_demotes_everything() {
         let entries = [entry(0, 1.0, true), entry(1, 0.5, false)];
-        let decisions: HashMap<_, _> = rank(&entries, 0, 0).into_iter().collect();
+        let decisions: HashMap<_, _> = rank_by_significance(&entries, 0, 0).into_iter().collect();
 
-        assert_eq!(decisions[&eid(0)], Decision::Demote);
-        assert_eq!(decisions[&eid(1)], Decision::Hold);
+        assert_eq!(decisions[&eid(0)], VoiceDecision::Demote);
+        assert_eq!(decisions[&eid(1)], VoiceDecision::Hold);
     }
 
     #[test]

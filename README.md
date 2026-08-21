@@ -258,6 +258,26 @@ the same slots. Significance does not currently factor in distance for
 spatial sounds -- bake any distance attenuation into `.with_volume()` or
 `.with_priority()` before sending.
 
+### Bring your own pool
+
+`VirtualVoiceQueuePlugin` always promotes into seedling's built-in
+`SpatialPool`/`DefaultPool`. If your game needs a different pool -- one with
+a custom effects chain (a low-pass filter for a muffling system, say) -- the
+ranking decision itself is exposed as a pure function so you can drive your
+own promotion/demotion and still get the crossfade for free:
+
+```rust
+use msg_seedling::{FadeInAudio, FadeOutAudio, SignificanceEntry, VoiceDecision, rank_by_significance};
+
+let decisions = rank_by_significance(&entries, max_audible, retiring_count);
+// For each `VoiceDecision::Promote`: insert your own pool marker + effects
+// chain + `FadeInAudio::new(crossfade, target_volume)`.
+// For each `VoiceDecision::Demote`: insert `FadeOutAudio::new(crossfade)`.
+```
+
+`FadeInAudio`/`FadeOutAudio` only need `SampleEffects` to work, so they're
+usable with any pool, not just the ones this crate spawns.
+
 ## Architecture
 
 `msg_seedling` is a thin convenience layer over `bevy_seedling`. It does not abstract away the node graph -- power users can use seedling's `Connect`, `SamplerPool`, effects chains, and bus routing directly alongside `msg_seedling`.
