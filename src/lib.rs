@@ -82,19 +82,25 @@
 
 #[cfg(not(target_arch = "wasm32"))]
 pub mod device_follow;
+pub mod fade;
 mod handlers;
 mod messages;
 mod randomization;
 #[cfg(test)]
 mod tests;
 mod traits;
+pub mod virtual_queue;
 mod volume;
 
 #[cfg(not(target_arch = "wasm32"))]
 pub use device_follow::FollowDefaultAudioDevice;
+pub use fade::{FadeInAudio, FadeOutAudio};
 pub use messages::{FadeAudio, PlayAudio, SpatialPosition, StopAudio};
 pub use randomization::{DefaultRandomization, Randomization};
 pub use traits::{AudioCategory, AudioConfig};
+pub use virtual_queue::{
+    Audible, PlayQueuedAudio, Retiring, VirtualSound, VirtualVoiceBudget, VirtualVoiceQueuePlugin,
+};
 
 use bevy::prelude::*;
 use bevy_seedling::prelude::*;
@@ -206,9 +212,14 @@ pub mod prelude {
     pub use crate::MsgSeedlingPlugin;
     #[cfg(not(target_arch = "wasm32"))]
     pub use crate::device_follow::FollowDefaultAudioDevice;
+    pub use crate::fade::{FadeInAudio, FadeOutAudio};
     pub use crate::messages::{FadeAudio, PlayAudio, SpatialPosition, StopAudio};
     pub use crate::randomization::{DefaultRandomization, Randomization};
     pub use crate::traits::{AudioCategory, AudioConfig};
+    pub use crate::virtual_queue::{
+        Audible, PlayQueuedAudio, Retiring, VirtualSound, VirtualVoiceBudget,
+        VirtualVoiceQueuePlugin,
+    };
 
     // Re-export commonly needed seedling types
     pub use bevy_seedling::prelude::{

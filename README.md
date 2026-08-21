@@ -8,7 +8,8 @@ Built on the [Firewheel](https://github.com/BillyDM/Firewheel) audio engine via 
 - **Message-based API** -- fire-and-forget `PlayAudio`, `StopAudio`, `FadeAudio` via Bevy messages
 - **Spatial audio** -- 2D/3D positioning with `Option<Vec2>` / `Option<Vec3>`, or parent entity attachment
 - **Randomization** -- configurable per-play volume and speed deviation with plugin-wide defaults
-- **Smooth fading** -- audio-thread `VolumeFade` for glitch-free fade-outs
+- **Smooth fading** -- audio-thread `VolumeFade` for glitch-free fade-outs, plus reusable `FadeInAudio`/`FadeOutAudio` components for any sample entity
+- **Virtual voice queue** -- opt-in, significance-ranked voice budget that crossfades between sounds instead of hard-cutting when a pool runs out of room
 
 ## Quick Start
 
@@ -18,7 +19,7 @@ Add to your `Cargo.toml`. Note: you must disable Bevy's default `bevy_audio` fea
 
 ```toml
 [dependencies]
-msg_seedling = "0.1"
+msg_seedling = "0.2"
 bevy_seedling = "0.7"
 bevy = { version = "0.18", default-features = false, features = [
     "2d_bevy_render", "default_app", "picking", "scene",
@@ -209,6 +210,54 @@ commands.insert_resource(FollowDefaultAudioDevice {
 });
 ```
 
+## Virtual Voice Queue
+
+`PlayAudio` hands a request straight to seedling's pool system. If the pool is
+already at its configured size, seedling steals whichever voice loses its
+internal priority tie-break -- instantly, with no fade. Two sounds trading
+places this way is audible as a hard cut, not a transition.
+
+`VirtualVoiceQueuePlugin<C>` is an opt-in alternative for category `C`: every
+`PlayQueuedAudio` request becomes a *virtual* entry ranked by **audible
+significance** (its resolved volume, times an optional priority weight), and
+only the top `VirtualVoiceBudget::max_audible` entries ever get a real
+`SamplePlayer`. When ranking changes, entries cross the line via
+`FadeInAudio`/`FadeOutAudio` instead of a hard cut -- promoting one voice
+while demoting another reads as an actual crossfade. Entries that don't make
+the cut aren't rejected outright: they wait as silent virtual entries and get
+promoted the moment a slot frees up or they become the most significant thing
+requested, up to `VirtualVoiceBudget::max_wait` -- past that they're dropped.
+
+```rust
+app.add_plugins(
+    VirtualVoiceQueuePlugin::<Sound>::new()
+        .with_budget(
+            VirtualVoiceBudget::<Sound>::new(16)
+                .with_crossfade(Duration::from_millis(50))
+                .with_max_wait(Duration::from_millis(500)),
+        ),
+);
+
+fn play_sounds(mut writer: MessageWriter<PlayQueuedAudio<Sound>>, server: Res<AssetServer>) {
+    // A quiet, low-priority ambience request: waits as virtual if the queue
+    // is full of louder things, promoted if room frees up.
+    writer.write(PlayQueuedAudio::new(server.load("wind.ogg"), Sound::Ambience).with_volume(0.2));
+
+    // A loud explosion: outranks quieter voices and crossfades in, smoothly
+    // displacing whichever currently-audible voice ranks lowest.
+    writer.write(PlayQueuedAudio::new(server.load("explosion.ogg"), Sound::Sfx).with_priority(2.0));
+}
+```
+
+This queue is independent of `PlayAudio`/`StopAudio`/`FadeAudio` and the
+per-category volume-update systems -- a promoted entry does not carry the
+bare `C` component those systems match on, so mixing the two paths for the
+same category is deliberately not wired together in this version. Budgets
+are scoped per category type `C`, so e.g. music and SFX never compete for
+the same slots. Significance does not currently factor in distance for
+spatial sounds -- bake any distance attenuation into `.with_volume()` or
+`.with_priority()` before sending.
+
 ## Architecture
 
 `msg_seedling` is a thin convenience layer over `bevy_seedling`. It does not abstract away the node graph -- power users can use seedling's `Connect`, `SamplerPool`, effects chains, and bus routing directly alongside `msg_seedling`.
@@ -223,12 +272,17 @@ commands.insert_resource(FollowDefaultAudioDevice {
 
 ### Voice management
 
-Handled entirely by seedling's pool system (`DefaultPool` for non-spatial, `SpatialPool` for spatial). No manual concurrency limits needed.
+`PlayAudio` is handled entirely by seedling's pool system (`DefaultPool` for
+non-spatial, `SpatialPool` for spatial) -- no manual concurrency limits, and
+no protection against a hard-cut steal when the pool is full. For a voice
+budget that crossfades instead of cutting, use `VirtualVoiceQueuePlugin<C>`
+and `PlayQueuedAudio` (see "Virtual Voice Queue" above).
 
 ## Bevy Compatibility
 
 | msg_seedling | bevy_seedling | Bevy |
 |-------------|---------------|------|
+| 0.2         | 0.7           | 0.18 |
 | 0.1         | 0.7           | 0.18 |
 
 ## License
