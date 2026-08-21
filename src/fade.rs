@@ -92,7 +92,25 @@ impl FadeOutAudio {
         self.despawn_on_complete = false;
         self
     }
+
+    /// Whether the fade has run its course — its duration elapsed since being
+    /// handed to the audio thread, or the unresolved-effects grace exhausted —
+    /// so the next fade-system run completes it.
+    #[must_use]
+    pub fn is_complete(&self) -> bool {
+        if self.triggered {
+            self.elapsed >= self.duration
+        } else {
+            self.waiting >= self.duration + UNRESOLVED_EFFECTS_GRACE
+        }
+    }
 }
+
+/// System set containing the fade drive systems. The virtual queue's systems
+/// run after this set, so a fade's completion (despawn or self-removal) is
+/// applied before queue decisions read the entity's state.
+#[derive(SystemSet, Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct FadeSystems;
 
 /// Marker resource: guards [`plugin`] against double-registration.
 ///
@@ -121,7 +139,9 @@ pub fn plugin(app: &mut App) {
     // re-promotes fades on related entities, the fade-in lands last.
     app.add_systems(
         Update,
-        (fade_out_audio_system, fade_in_audio_system).chain(),
+        (fade_out_audio_system, fade_in_audio_system)
+            .chain()
+            .in_set(FadeSystems),
     );
 }
 
@@ -157,7 +177,7 @@ fn fade_out_audio_system(
     for (entity, mut fade, effects) in &mut query {
         if fade.triggered {
             fade.elapsed += delta;
-            if fade.elapsed >= fade.duration {
+            if fade.is_complete() {
                 complete_fade_out(&mut commands, entity, &fade);
             }
             continue;
@@ -176,7 +196,7 @@ fn fade_out_audio_system(
         }
 
         fade.waiting += delta;
-        if fade.waiting >= fade.duration + UNRESOLVED_EFFECTS_GRACE {
+        if fade.is_complete() {
             complete_fade_out(&mut commands, entity, &fade);
         }
     }

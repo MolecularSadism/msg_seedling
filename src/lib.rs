@@ -139,7 +139,7 @@ mod volume;
 
 #[cfg(not(target_arch = "wasm32"))]
 pub use device_follow::FollowDefaultAudioDevice;
-pub use fade::{FadeInAudio, FadeOutAudio};
+pub use fade::{FadeInAudio, FadeOutAudio, FadeSystems};
 pub use messages::{FadeAudio, PlayAudio, SpatialPosition, StopAudio};
 pub use randomization::{DefaultRandomization, Randomization};
 pub use traits::{AudioCategory, AudioConfig};

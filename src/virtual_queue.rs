@@ -118,7 +118,7 @@ use bevy_seedling::pool::{CompletionReason, Sampler};
 use bevy_seedling::prelude::*;
 use bevy_seedling::sample::{AudioSample, QueuedSample};
 
-use crate::fade::{FadeInAudio, FadeOutAudio};
+use crate::fade::{FadeInAudio, FadeOutAudio, FadeSystems};
 use crate::messages::SpatialPosition;
 use crate::traits::AudioCategory;
 
@@ -438,7 +438,11 @@ impl<C: AudioCategory> Plugin for VirtualVoiceQueuePlugin<C> {
                 ),
                 rank_virtual_voices::<C>,
             )
-                .chain(),
+                .chain()
+                // Fade completions must be applied before queue decisions
+                // read entry state, so a completing fade and a same-frame
+                // stop cannot race.
+                .after(FadeSystems),
         );
     }
 }
@@ -770,6 +774,10 @@ fn handle_stop_queued_audio<C: AudioCategory>(
                 demote(&mut commands, entity, false, budget.crossfade);
             } else if retiring {
                 match fades.get_mut(entity) {
+                    // A finished fade completes (removal or despawn) before
+                    // this system reads it again — mutating it would be
+                    // lost, so despawn outright.
+                    Ok(fade) if fade.is_complete() => commands.entity(entity).despawn(),
                     Ok(mut fade) => fade.despawn_on_complete = true,
                     Err(_) => commands.entity(entity).despawn(),
                 }
@@ -1456,6 +1464,40 @@ mod tests {
             .map(VirtualSound::category)
             .collect();
         assert_eq!(audible, vec![TestSound::Ambience]);
+    }
+
+    #[test]
+    fn stop_around_fade_completion_always_despawns() {
+        // A stop arriving on the exact frame a keep-entity demotion fade
+        // completes must not be lost to the fade's own self-removal —
+        // sweep stop delivery across the completion window to cover it.
+        for stop_after in (0..=40).step_by(2) {
+            let mut app = queue_app(VirtualVoiceBudget::new(1).with_crossfade(Duration::ZERO));
+            app.world_mut()
+                .write_message(PlayQueuedAudio::new(handle(1), TestSound::Sfx).looping());
+            app.update_n(1);
+            // Loud enough to beat the displacement margin and demote the
+            // incumbent into its keep-entity retiring fade.
+            app.world_mut().write_message(
+                PlayQueuedAudio::new(handle(2), TestSound::Sfx)
+                    .looping()
+                    .with_volume(2.0),
+            );
+            app.update_n(1);
+
+            app.update_n(stop_after);
+            app.world_mut()
+                .write_message(StopQueuedAudio::<TestSound>::all().with_handle(handle(1)));
+            app.update_n(60);
+
+            let world = app.world_mut();
+            let survivors: Vec<Handle<AudioSample>> = world
+                .query::<&VirtualSound<TestSound>>()
+                .iter(world)
+                .map(|sound| sound.handle.clone())
+                .collect();
+            assert_eq!(survivors, vec![handle(2)], "stop_after={stop_after}");
+        }
     }
 
     #[test]
