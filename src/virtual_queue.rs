@@ -337,7 +337,10 @@ impl<C: AudioCategory> PlayQueuedAudio<C> {
 ///
 /// Audible entries fade out over the budget's crossfade and despawn; virtual
 /// (waiting) entries despawn immediately; already-retiring entries are
-/// switched to despawn when their fade completes.
+/// switched to despawn when their fade completes. Only entries existing at
+/// the start of the frame are stopped: a [`PlayQueuedAudio`] written the
+/// same frame spawns its entry after stop handling, so the just-requested
+/// sound plays on.
 #[derive(Message, Clone)]
 pub struct StopQueuedAudio<C: AudioCategory> {
     /// The category to stop. `None` = stop every queued entry of type `C`.
@@ -617,6 +620,10 @@ fn rank_virtual_voices<C: AudioCategory>(
     }
 }
 
+/// Gives an entry a real voice. `SamplePriority` is inserted at the budget's
+/// elevated value on every promotion, overwriting the `SamplePriority(0)` a
+/// demotion drops the entry to, so a re-promoted loop defends its voice
+/// again.
 fn promote<C: AudioCategory>(
     commands: &mut Commands,
     entity: Entity,
@@ -658,7 +665,9 @@ fn promote<C: AudioCategory>(
 }
 
 /// Starts a demotion fade: looping entries keep their entity and return to
-/// virtual once the fade completes; one-shots despawn with it.
+/// virtual once the fade completes; one-shots despawn with it. The voice
+/// drops back to default `SamplePriority`, so pool pressure steals the
+/// nearly-silent fader before any live promoted voice.
 fn demote(commands: &mut Commands, entity: Entity, looping: bool, crossfade: Duration) {
     let fade = if looping {
         FadeOutAudio::new(crossfade).keep_entity()
@@ -668,17 +677,20 @@ fn demote(commands: &mut Commands, entity: Entity, looping: bool, crossfade: Dur
     commands
         .entity(entity)
         .remove::<(Audible, FadeInAudio)>()
-        .insert((Retiring, fade));
+        .insert((Retiring, SamplePriority(0), fade));
 }
 
 /// Returns a demoted looping entry to the virtual state once its fade-out
 /// completes ([`FadeOutAudio`] removes itself, leaving `Retiring` behind).
 fn finish_demotions<C: AudioCategory>(
     mut commands: Commands,
-    finished: Query<Entity, (With<VirtualSound<C>>, With<Retiring>, Without<FadeOutAudio>)>,
+    finished: Query<
+        (Entity, Has<Sampler>),
+        (With<VirtualSound<C>>, With<Retiring>, Without<FadeOutAudio>),
+    >,
 ) {
-    for entity in &finished {
-        release_voice(&mut commands, entity);
+    for (entity, has_sampler) in &finished {
+        release_voice(&mut commands, entity, has_sampler);
     }
 }
 
@@ -688,13 +700,13 @@ fn finish_demotions<C: AudioCategory>(
 fn reclaim_lost_voices<C: AudioCategory>(
     mut commands: Commands,
     lost: Query<
-        (Entity, &VirtualSound<C>),
+        (Entity, &VirtualSound<C>, Has<Sampler>),
         (With<Audible>, Without<SamplePlayer>, Without<Retiring>),
     >,
 ) {
-    for (entity, sound) in &lost {
+    for (entity, sound, has_sampler) in &lost {
         if sound.looping {
-            release_voice(&mut commands, entity);
+            release_voice(&mut commands, entity, has_sampler);
         } else {
             commands.entity(entity).despawn();
         }
@@ -703,14 +715,19 @@ fn reclaim_lost_voices<C: AudioCategory>(
 
 /// Strips everything a promotion added, leaving a bare [`VirtualSound`]
 /// entry eligible for re-promotion.
-fn release_voice(commands: &mut Commands, entity: Entity) {
-    // Seedling's completion observer (when `SeedlingPlugin` is present)
-    // releases the sampler and strips its private bookkeeping; the explicit
-    // removes below cover the same ground when it is not.
-    commands.trigger(PlaybackCompletion {
-        entity,
-        reason: CompletionReason::PlaybackInterrupted,
-    });
+fn release_voice(commands: &mut Commands, entity: Entity, has_sampler: bool) {
+    // A live sampler needs seedling's completion observer (when
+    // `SeedlingPlugin` is present) to release it and strip its private
+    // bookkeeping. On the reclaim path seedling already completed the voice
+    // and removed `Sampler`, so skipping the trigger there avoids a second
+    // `PlaybackCompletion` for the same voice; the explicit removes below
+    // cover everything else either way.
+    if has_sampler {
+        commands.trigger(PlaybackCompletion {
+            entity,
+            reason: CompletionReason::PlaybackInterrupted,
+        });
+    }
     commands
         .entity(entity)
         .despawn_related::<SampleEffects>()
@@ -1080,6 +1097,9 @@ mod tests {
         assert!(app.world().get::<Retiring>(quiet).is_some());
         let fade = app.world().get::<FadeOutAudio>(quiet).expect("fading out");
         assert!(!fade.despawn_on_complete);
+        // The retiring fader drops to default priority so pool pressure
+        // steals it before any live promoted voice.
+        assert_eq!(app.world().get::<SamplePriority>(quiet).unwrap().0, 0);
 
         // Effects never resolve in tests, so completion waits out the
         // unresolved-effects grace; step well past it.
