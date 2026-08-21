@@ -126,6 +126,7 @@ const DEFAULT_MAX_AUDIBLE: usize = 16;
 const DEFAULT_CROSSFADE: Duration = Duration::from_millis(50);
 const DEFAULT_MAX_WAIT: Duration = Duration::from_millis(500);
 const DEFAULT_SAMPLE_PRIORITY: i32 = 2;
+const DEFAULT_DISPLACEMENT_MARGIN: f32 = 1.25;
 
 /// Budget for one category type's significance-ranked voice queue.
 ///
@@ -146,13 +147,22 @@ pub struct VirtualVoiceBudget<C: AudioCategory> {
     /// Seedling `SamplePriority` given to promoted voices, so
     /// default-priority (0) one-shots sharing the pool cannot steal them.
     pub sample_priority: i32,
+    /// Incumbent bonus: a newcomer must exceed an audible voice's
+    /// significance by this factor to displace it. The default `1.25`
+    /// (~2 dB) is hysteresis against crossfade flutter when two sounds
+    /// hover near equal loudness — without it an epsilon-louder newcomer
+    /// churns demotions, and each loop demotion restarts playback from the
+    /// beginning. Applied by multiplying audible entries' significance
+    /// before [`rank_by_significance`], whose own semantics stay
+    /// margin-unaware. Sanitized to `>= 1.0` (`1.0` = no hysteresis).
+    pub displacement_margin: f32,
     _phantom: core::marker::PhantomData<C>,
 }
 
 impl<C: AudioCategory> VirtualVoiceBudget<C> {
     /// Creates a budget for up to `max_audible` simultaneous real voices,
-    /// using the default crossfade (50ms), max wait (500ms), and sample
-    /// priority (2).
+    /// using the default crossfade (50ms), max wait (500ms), sample
+    /// priority (2), and displacement margin (1.25).
     #[must_use]
     pub fn new(max_audible: usize) -> Self {
         Self {
@@ -160,6 +170,7 @@ impl<C: AudioCategory> VirtualVoiceBudget<C> {
             crossfade: DEFAULT_CROSSFADE,
             max_wait: DEFAULT_MAX_WAIT,
             sample_priority: DEFAULT_SAMPLE_PRIORITY,
+            displacement_margin: DEFAULT_DISPLACEMENT_MARGIN,
             _phantom: core::marker::PhantomData,
         }
     }
@@ -182,6 +193,17 @@ impl<C: AudioCategory> VirtualVoiceBudget<C> {
     #[must_use]
     pub fn with_sample_priority(mut self, sample_priority: i32) -> Self {
         self.sample_priority = sample_priority;
+        self
+    }
+
+    /// Sets the incumbent-bonus displacement margin, sanitized to `>= 1.0`.
+    #[must_use]
+    pub fn with_displacement_margin(mut self, displacement_margin: f32) -> Self {
+        self.displacement_margin = if displacement_margin.is_finite() {
+            displacement_margin.max(1.0)
+        } else {
+            1.0
+        };
         self
     }
 }
@@ -539,6 +561,8 @@ fn rank_virtual_voices<C: AudioCategory>(
     retiring: Query<(), (With<Retiring>, With<VirtualSound<C>>)>,
 ) {
     let retiring_count = retiring.iter().count();
+    // `f32::max` also maps a NaN margin (written past the builder) to 1.0.
+    let margin = budget.displacement_margin.max(1.0);
 
     let mut entries: Vec<SignificanceEntry> = Vec::new();
     let mut sounds: Vec<(&VirtualSound<C>, f32)> = Vec::new();
@@ -550,10 +574,15 @@ fn rank_virtual_voices<C: AudioCategory>(
             commands.entity(entity).despawn();
             continue;
         }
-        let target_volume = sound.category.volume(&config) * sound.base_volume;
+        let target_volume = sanitize_weight(sound.category.volume(&config) * sound.base_volume);
+        let significance = target_volume * sound.priority;
         entries.push(SignificanceEntry {
             entity,
-            significance: target_volume * sound.priority,
+            significance: if audible {
+                significance * margin
+            } else {
+                significance
+            },
             audible,
         });
         sounds.push((sound, target_volume));
@@ -953,12 +982,23 @@ mod tests {
         let budget = VirtualVoiceBudget::<TestSound>::new(8)
             .with_crossfade(Duration::from_millis(30))
             .with_max_wait(Duration::from_millis(200))
-            .with_sample_priority(5);
+            .with_sample_priority(5)
+            .with_displacement_margin(2.0);
 
         assert_eq!(budget.max_audible, 8);
         assert_eq!(budget.crossfade, Duration::from_millis(30));
         assert_eq!(budget.max_wait, Duration::from_millis(200));
         assert_eq!(budget.sample_priority, 5);
+        assert_eq!(budget.displacement_margin, 2.0);
+    }
+
+    #[test]
+    fn budget_builder_sanitizes_the_displacement_margin() {
+        let below_one = VirtualVoiceBudget::<TestSound>::new(1).with_displacement_margin(0.5);
+        assert_eq!(below_one.displacement_margin, 1.0);
+
+        let non_finite = VirtualVoiceBudget::<TestSound>::new(1).with_displacement_margin(f32::NAN);
+        assert_eq!(non_finite.displacement_margin, 1.0);
     }
 
     #[test]
@@ -1322,6 +1362,80 @@ mod tests {
                 .count(),
             0
         );
+    }
+
+    #[test]
+    fn newcomer_inside_the_displacement_margin_does_not_displace() {
+        let mut app = queue_app(VirtualVoiceBudget::new(1));
+        app.world_mut()
+            .write_message(PlayQueuedAudio::new(handle(1), TestSound::Sfx).looping());
+        app.update_n(1);
+
+        let world = app.world_mut();
+        let incumbent = world
+            .query_filtered::<Entity, With<Audible>>()
+            .single(world)
+            .expect("incumbent promoted");
+
+        // 10% louder: inside the default 1.25 margin, so no churn.
+        app.world_mut().write_message(
+            PlayQueuedAudio::new(handle(2), TestSound::Sfx)
+                .looping()
+                .with_volume(1.1),
+        );
+        app.update_n(2);
+
+        assert!(app.world().get::<Audible>(incumbent).is_some());
+        assert!(app.world().get::<Retiring>(incumbent).is_none());
+    }
+
+    #[test]
+    fn newcomer_beyond_the_displacement_margin_displaces() {
+        let mut app = queue_app(VirtualVoiceBudget::new(1));
+        app.world_mut()
+            .write_message(PlayQueuedAudio::new(handle(1), TestSound::Sfx).looping());
+        app.update_n(1);
+
+        let world = app.world_mut();
+        let incumbent = world
+            .query_filtered::<Entity, With<Audible>>()
+            .single(world)
+            .expect("incumbent promoted");
+
+        // 30% louder: beats the default 1.25 margin.
+        app.world_mut().write_message(
+            PlayQueuedAudio::new(handle(2), TestSound::Sfx)
+                .looping()
+                .with_volume(1.3),
+        );
+        app.update_n(1);
+
+        assert!(app.world().get::<Audible>(incumbent).is_none());
+        assert!(app.world().get::<Retiring>(incumbent).is_some());
+    }
+
+    #[test]
+    fn nan_config_volume_is_sanitized_before_ranking() {
+        let mut app = queue_app(VirtualVoiceBudget::new(1));
+        app.world_mut().resource_mut::<TestConfig>().sfx = f32::NAN;
+        app.world_mut()
+            .write_message(PlayQueuedAudio::new(handle(1), TestSound::Sfx).looping());
+        app.world_mut().write_message(
+            PlayQueuedAudio::new(handle(2), TestSound::Ambience)
+                .looping()
+                .with_volume(0.5),
+        );
+        app.update_n(1);
+
+        // NaN significance would outrank everything under `total_cmp`; the
+        // sanitized recompute ranks the NaN-config category at zero instead.
+        let world = app.world_mut();
+        let audible: Vec<TestSound> = world
+            .query_filtered::<&VirtualSound<TestSound>, With<Audible>>()
+            .iter(world)
+            .map(VirtualSound::category)
+            .collect();
+        assert_eq!(audible, vec![TestSound::Ambience]);
     }
 
     #[test]
