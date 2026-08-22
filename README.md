@@ -15,7 +15,8 @@ Built on the [Firewheel](https://github.com/BillyDM/Firewheel) audio engine via 
 
 ### 1. Dependencies
 
-Add to your `Cargo.toml`. Note: you must disable Bevy's default `bevy_audio` feature.
+Add to your `Cargo.toml`. Disable Bevy's `bevy_audio` feature: it rides along with
+the `2d`, `3d` and `ui` feature groups, and nothing here plays through it.
 
 ```toml
 [dependencies]
@@ -29,6 +30,14 @@ bevy = { version = "0.18", default-features = false, features = [
     "wayland", "webgl2", "x11",
 ] }
 ```
+
+Leaving `bevy_audio` on is supported but pointless. Every sound is a
+`bevy_seedling` sample, so Bevy's audio stack is overridden either way, while
+still opening a second OS output stream, registering competing loaders for
+`ogg`/`wav`/`mp3`, and — on Linux — pulling in an `alsa-sys` major that cannot
+link alongside firewheel's. `MsgSeedlingPlugin` warns at startup whenever it
+finds Bevy's `AudioPlugin` live; if you cannot drop the feature, at least build
+`DefaultPlugins` with `.disable::<bevy::audio::AudioPlugin>()`.
 
 ### 2. Define categories
 
