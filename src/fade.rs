@@ -12,6 +12,10 @@ use core::time::Duration;
 use bevy::prelude::*;
 use bevy_seedling::prelude::*;
 
+/// How long past its duration an untriggered fade-out waits for its
+/// `SampleEffects` to resolve before completing without a ramp.
+const UNRESOLVED_EFFECTS_GRACE: Duration = Duration::from_millis(500);
+
 /// Fades an entity's `VolumeNode` in from silence to a target volume.
 ///
 /// Removes itself once the fade has been handed to the audio thread — it
@@ -24,7 +28,6 @@ use bevy_seedling::prelude::*;
 #[reflect(Component)]
 pub struct FadeInAudio {
     /// Duration of the fade.
-    #[reflect(ignore)]
     pub duration: Duration,
     /// Target linear volume (0.0–1.0) to fade to.
     pub target_volume: f32,
@@ -44,24 +47,27 @@ impl FadeInAudio {
 /// Fades an entity's `VolumeNode` out to silence, optionally despawning it
 /// once the fade completes.
 ///
-/// Like [`FadeInAudio`], the fade is handed to the audio thread as soon as
-/// `SampleEffects` resolves; [`despawn_on_complete`](Self::despawn_on_complete)
-/// tracks elapsed time on the game side purely to schedule that despawn —
-/// the actual ramp always runs on the audio thread regardless of frame rate.
+/// The fade is handed to the audio thread as soon as `SampleEffects`
+/// resolves a `VolumeNode`; the game side tracks elapsed time from that
+/// moment purely to schedule completion — the ramp itself always runs on the
+/// audio thread regardless of frame rate. On completion the entity is
+/// despawned, or with [`keep_entity`](Self::keep_entity) only this component
+/// is removed. An entity whose effects never resolve (e.g. its voice was
+/// stolen mid-fade) still completes once its duration plus a grace period
+/// has passed since insertion, so nothing leaks.
 #[derive(Component, Reflect, Debug, Clone)]
 #[reflect(Component)]
 pub struct FadeOutAudio {
     /// Duration of the fade.
-    #[reflect(ignore)]
     pub duration: Duration,
-    /// Whether to despawn the entity once `duration` has elapsed.
+    /// Whether to despawn the entity once the fade completes.
     pub despawn_on_complete: bool,
     /// Whether the fade has been handed to the audio thread yet.
-    #[reflect(ignore)]
     triggered: bool,
-    /// Time elapsed since this component was added.
-    #[reflect(ignore)]
+    /// Time elapsed since the fade was handed to the audio thread.
     elapsed: Duration,
+    /// Time spent waiting for `SampleEffects` to resolve.
+    waiting: Duration,
 }
 
 impl FadeOutAudio {
@@ -74,17 +80,37 @@ impl FadeOutAudio {
             despawn_on_complete: true,
             triggered: false,
             elapsed: Duration::ZERO,
+            waiting: Duration::ZERO,
         }
     }
 
     /// Keeps the entity alive after the fade completes instead of despawning
-    /// it — useful for silencing a looping sound without losing its identity.
+    /// it — the component removes itself on completion. Useful for silencing
+    /// a looping sound without losing its identity.
     #[must_use]
     pub fn keep_entity(mut self) -> Self {
         self.despawn_on_complete = false;
         self
     }
+
+    /// Whether the fade has run its course — its duration elapsed since being
+    /// handed to the audio thread, or the unresolved-effects grace exhausted —
+    /// so the next fade-system run completes it.
+    #[must_use]
+    pub fn is_complete(&self) -> bool {
+        if self.triggered {
+            self.elapsed >= self.duration
+        } else {
+            self.waiting >= self.duration + UNRESOLVED_EFFECTS_GRACE
+        }
+    }
 }
+
+/// System set containing the fade drive systems. The virtual queue's systems
+/// run after this set, so a fade's completion (despawn or self-removal) is
+/// applied before queue decisions read the entity's state.
+#[derive(SystemSet, Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct FadeSystems;
 
 /// Marker resource: guards [`plugin`] against double-registration.
 ///
@@ -109,16 +135,23 @@ pub fn plugin(app: &mut App) {
     app.insert_resource(FadeSystemsRegistered);
     app.register_type::<FadeInAudio>();
     app.register_type::<FadeOutAudio>();
-    app.add_systems(Update, (fade_in_audio_system, fade_out_audio_system));
+    // Fade-out first, deterministically: if one frame both demotes and
+    // re-promotes fades on related entities, the fade-in lands last.
+    app.add_systems(
+        Update,
+        (fade_out_audio_system, fade_in_audio_system)
+            .chain()
+            .in_set(FadeSystems),
+    );
 }
 
 /// Hands [`FadeInAudio`] to the audio thread and removes the component.
 fn fade_in_audio_system(
     mut commands: Commands,
-    mut query: Query<(Entity, &FadeInAudio, &SampleEffects)>,
+    query: Query<(Entity, &FadeInAudio, &SampleEffects)>,
     mut volume_nodes: Query<(&VolumeNode, &mut AudioEvents)>,
 ) {
-    for (entity, fade, effects) in &mut query {
+    for (entity, fade, effects) in &query {
         let Ok((volume_node, mut events)) = volume_nodes.get_effect_mut(effects) else {
             continue;
         };
@@ -131,18 +164,26 @@ fn fade_in_audio_system(
     }
 }
 
-/// Hands [`FadeOutAudio`] to the audio thread on first sight, then despawns
-/// the entity once its duration has elapsed (if configured to).
+/// Hands [`FadeOutAudio`] to the audio thread on first sight, then completes
+/// (despawn or self-removal) once its duration has elapsed since triggering.
 fn fade_out_audio_system(
     mut commands: Commands,
     time: Res<Time>,
-    mut query: Query<(Entity, &mut FadeOutAudio, &SampleEffects)>,
+    mut query: Query<(Entity, &mut FadeOutAudio, Option<&SampleEffects>)>,
     mut volume_nodes: Query<(&VolumeNode, &mut AudioEvents)>,
 ) {
     let delta = time.delta();
 
     for (entity, mut fade, effects) in &mut query {
-        if !fade.triggered
+        if fade.triggered {
+            fade.elapsed += delta;
+            if fade.is_complete() {
+                complete_fade_out(&mut commands, entity, &fade);
+            }
+            continue;
+        }
+
+        if let Some(effects) = effects
             && let Ok((volume_node, mut events)) = volume_nodes.get_effect_mut(effects)
         {
             volume_node.fade_to(
@@ -151,19 +192,45 @@ fn fade_out_audio_system(
                 &mut events,
             );
             fade.triggered = true;
+            continue;
         }
 
-        fade.elapsed += delta;
-
-        if fade.elapsed >= fade.duration && fade.despawn_on_complete {
-            commands.entity(entity).despawn();
+        fade.waiting += delta;
+        if fade.is_complete() {
+            complete_fade_out(&mut commands, entity, &fade);
         }
+    }
+}
+
+fn complete_fade_out(commands: &mut Commands, entity: Entity, fade: &FadeOutAudio) {
+    if fade.despawn_on_complete {
+        commands.entity(entity).despawn();
+    } else {
+        commands.entity(entity).remove::<FadeOutAudio>();
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use msg_testing::{AppTesting, physics_app};
+
+    fn fade_app() -> App {
+        let mut app = physics_app();
+        app.add_systems(Update, fade_out_audio_system);
+        app
+    }
+
+    /// Steps enough fixed frames (~15.6ms each) to pass `duration` plus the
+    /// unresolved-effects grace.
+    fn steps_past_grace(app: &App, duration: Duration) -> usize {
+        let timestep = app
+            .world()
+            .resource::<Time<Fixed>>()
+            .timestep()
+            .as_secs_f64();
+        ((duration + UNRESOLVED_EFFECTS_GRACE).as_secs_f64() / timestep).ceil() as usize + 1
+    }
 
     #[test]
     fn fade_in_clamps_target_volume() {
@@ -187,29 +254,46 @@ mod tests {
     }
 
     #[test]
-    fn fade_out_system_despawns_after_duration() {
-        use msg_testing::{AppTesting, physics_app};
+    fn untriggered_fade_out_survives_its_duration_then_hits_the_grace_deadline() {
+        let mut app = fade_app();
+        let duration = Duration::from_millis(10);
 
-        let mut app = physics_app();
-        app.add_systems(Update, fade_out_audio_system);
-
-        // The outer query requires `SampleEffects`, which only a relationship
-        // spawn (not a bare `Default`) can produce — `sample_effects!` links
-        // a real (if audio-backend-less) effect child, same as production
-        // code. `AudioEvents` never resolves without a running audio
-        // context, so the trigger itself silently no-ops here; this test
-        // exercises only the elapsed-time despawn scheduling.
+        // `AudioEvents` never resolves without a running audio context, so
+        // the fade stays untriggered and only the fallback deadline applies.
         let entity = app
             .world_mut()
             .spawn((
-                FadeOutAudio::new(Duration::from_millis(10)),
+                FadeOutAudio::new(duration),
                 sample_effects![VolumeNode::from_linear(1.0)],
             ))
             .id();
 
-        // `physics_app()` steps `Time` by one fixed timestep (~15.6ms)
-        // per `update()`, already past the 10ms fade duration.
-        app.update_n(1);
+        // Well past the 10ms duration but within the grace: still alive, so
+        // a late-resolving fade would keep its full tail.
+        app.update_n(3);
+        assert!(app.world().get_entity(entity).is_ok());
+
+        let steps = steps_past_grace(&app, duration);
+        app.update_n(steps);
         assert!(app.world().get_entity(entity).is_err());
+    }
+
+    #[test]
+    fn keep_entity_fade_out_removes_itself_and_leaves_the_entity() {
+        let mut app = fade_app();
+        let duration = Duration::from_millis(10);
+
+        let entity = app
+            .world_mut()
+            .spawn((
+                FadeOutAudio::new(duration).keep_entity(),
+                sample_effects![VolumeNode::from_linear(1.0)],
+            ))
+            .id();
+
+        let steps = steps_past_grace(&app, duration);
+        app.update_n(steps + 3);
+        assert!(app.world().get_entity(entity).is_ok());
+        assert!(app.world().get::<FadeOutAudio>(entity).is_none());
     }
 }

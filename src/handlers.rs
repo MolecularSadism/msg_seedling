@@ -14,7 +14,6 @@ pub fn handle_play_audio<C: AudioCategory>(
     config: Res<C::Config>,
     mut messages: MessageReader<PlayAudio<C>>,
 ) {
-    #[allow(deprecated)]
     use rand::Rng;
 
     for msg in messages.read() {

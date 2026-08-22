@@ -9,7 +9,7 @@ Built on the [Firewheel](https://github.com/BillyDM/Firewheel) audio engine via 
 - **Spatial audio** -- 2D/3D positioning with `Option<Vec2>` / `Option<Vec3>`, or parent entity attachment
 - **Randomization** -- configurable per-play volume and speed deviation with plugin-wide defaults
 - **Smooth fading** -- audio-thread `VolumeFade` for glitch-free fade-outs, plus reusable `FadeInAudio`/`FadeOutAudio` components for any sample entity
-- **Virtual voice queue** -- opt-in, significance-ranked voice budget that crossfades between sounds instead of hard-cutting when a pool runs out of room
+- **Virtual voice queue** -- opt-in, significance-ranked voice budget that crossfades between sounds instead of hard-cutting when a pool runs out of room; displaced loops wait silently and come back
 
 ## Quick Start
 
@@ -19,7 +19,7 @@ Add to your `Cargo.toml`. Note: you must disable Bevy's default `bevy_audio` fea
 
 ```toml
 [dependencies]
-msg_seedling = "0.2"
+msg_seedling = "0.3"
 bevy_seedling = "0.7"
 bevy = { version = "0.18", default-features = false, features = [
     "2d_bevy_render", "default_app", "picking", "scene",
@@ -223,10 +223,27 @@ significance** (its resolved volume, times an optional priority weight), and
 only the top `VirtualVoiceBudget::max_audible` entries ever get a real
 `SamplePlayer`. When ranking changes, entries cross the line via
 `FadeInAudio`/`FadeOutAudio` instead of a hard cut -- promoting one voice
-while demoting another reads as an actual crossfade. Entries that don't make
-the cut aren't rejected outright: they wait as silent virtual entries and get
-promoted the moment a slot frees up or they become the most significant thing
-requested, up to `VirtualVoiceBudget::max_wait` -- past that they're dropped.
+while demoting another reads as an actual crossfade. Significance tracks the
+category volume from your config resource live, so a settings change
+re-ranks waiting and audible entries on the next frame.
+
+Entries that don't make the cut aren't rejected outright: they wait as
+silent virtual entries and get promoted the moment a slot frees up or they
+become the most significant thing requested. Looping entries wait
+indefinitely; one-shots give up after `VirtualVoiceBudget::max_wait`.
+Demotion follows the same split: a demoted **looping** entry fades out,
+drops its `SamplePlayer`, and returns to the silent virtual state, eligible
+for re-promotion (playback restarts from the beginning); a demoted
+**one-shot** despawns after its fade, since a partially-played one-shot
+restarting later would be wrong. Voices that end inside seedling -- stolen,
+expired in the sampler queue, or finished playing -- are reclaimed under the
+same policy.
+
+Promoted voices carry `VirtualVoiceBudget::sample_priority` (default 2) as
+their seedling `SamplePriority`, so default-priority `PlayAudio` one-shots
+sharing the pool cannot steal them. Size the target pool so `max_audible`
+plus the crossfades you expect in flight fit within its `PoolSize` --
+during a crossfade the outgoing and incoming voices briefly coexist.
 
 ```rust
 app.add_plugins(
@@ -234,29 +251,44 @@ app.add_plugins(
         .with_budget(
             VirtualVoiceBudget::<Sound>::new(16)
                 .with_crossfade(Duration::from_millis(50))
-                .with_max_wait(Duration::from_millis(500)),
+                .with_max_wait(Duration::from_millis(500))
+                .with_sample_priority(2),
         ),
 );
 
 fn play_sounds(mut writer: MessageWriter<PlayQueuedAudio<Sound>>, server: Res<AssetServer>) {
-    // A quiet, low-priority ambience request: waits as virtual if the queue
-    // is full of louder things, promoted if room frees up.
-    writer.write(PlayQueuedAudio::new(server.load("wind.ogg"), Sound::Ambience).with_volume(0.2));
+    // A quiet looping ambience: waits as virtual if the queue is full of
+    // louder things, promoted if room frees up, and comes back after being
+    // temporarily displaced.
+    writer.write(
+        PlayQueuedAudio::new(server.load("wind.ogg"), Sound::Ambience)
+            .looping()
+            .with_volume(0.2),
+    );
 
     // A loud explosion: outranks quieter voices and crossfades in, smoothly
     // displacing whichever currently-audible voice ranks lowest.
     writer.write(PlayQueuedAudio::new(server.load("explosion.ogg"), Sound::Sfx).with_priority(2.0));
 }
+
+fn leave_storm_area(mut stop: MessageWriter<StopQueuedAudio<Sound>>, wind: Res<WindSample>) {
+    // Fade out and drop the ambience loop -- audible entries fade over the
+    // budget's crossfade, waiting virtual entries despawn immediately.
+    stop.write(StopQueuedAudio::<Sound>::all().with_handle(wind.0.clone()));
+
+    // Or stop a whole category:
+    stop.write(StopQueuedAudio::category(Sound::Ambience));
+}
 ```
 
 This queue is independent of `PlayAudio`/`StopAudio`/`FadeAudio` and the
 per-category volume-update systems -- a promoted entry does not carry the
-bare `C` component those systems match on, so mixing the two paths for the
-same category is deliberately not wired together in this version. Budgets
-are scoped per category type `C`, so e.g. music and SFX never compete for
-the same slots. Significance does not currently factor in distance for
-spatial sounds -- bake any distance attenuation into `.with_volume()` or
-`.with_priority()` before sending.
+bare `C` component those systems match on, so queued entries are stopped via
+`StopQueuedAudio` instead. `PlayQueuedAudio` carries no `Randomization`
+support. Budgets are scoped per category type `C`, so e.g. music and SFX
+never compete for the same slots. Significance does not currently factor in
+distance for spatial sounds -- bake any distance attenuation into
+`.with_volume()` or `.with_priority()` before sending.
 
 ### Bring your own pool
 
@@ -302,6 +334,7 @@ and `PlayQueuedAudio` (see "Virtual Voice Queue" above).
 
 | msg_seedling | bevy_seedling | Bevy |
 |-------------|---------------|------|
+| 0.3         | 0.7           | 0.18 |
 | 0.2         | 0.7           | 0.18 |
 | 0.1         | 0.7           | 0.18 |
 

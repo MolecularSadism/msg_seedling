@@ -10,7 +10,7 @@
 //!
 //! 1. Define your audio categories:
 //!
-//! ```rust,ignore
+//! ```
 //! use bevy::prelude::*;
 //! use msg_seedling::prelude::*;
 //!
@@ -49,7 +49,24 @@
 //!
 //! 2. Add the plugin:
 //!
-//! ```rust,ignore
+//! ```
+//! # use bevy::prelude::*;
+//! # use msg_seedling::prelude::*;
+//! # #[derive(Component, Clone, Copy, Default, Debug, PartialEq, Eq, Hash, Reflect)]
+//! # #[reflect(Component)]
+//! # enum Sound { #[default] Sfx }
+//! # #[derive(Resource, Clone, Default)]
+//! # struct GameAudioConfig;
+//! # impl AudioConfig for GameAudioConfig {
+//! #     fn master_volume(&self) -> f32 { 1.0 }
+//! # }
+//! # impl AudioCategory for Sound {
+//! #     type Config = GameAudioConfig;
+//! #     fn volume(&self, _config: &GameAudioConfig) -> f32 { 1.0 }
+//! # }
+//! # let mut app = App::new();
+//! # app.add_plugins(MinimalPlugins);
+//! # app.init_resource::<GameAudioConfig>();
 //! app.add_plugins(MsgSeedlingPlugin::<Sound>::default());
 //! ```
 //!
@@ -58,14 +75,37 @@
 //!    user switches it. It is independent of the category type, so add it
 //!    once:
 //!
-//! ```rust,ignore
+//! ```
+//! # use bevy::prelude::*;
+//! # let mut app = App::new();
+//! # app.add_plugins(MinimalPlugins);
 //! app.add_plugins(msg_seedling::device_follow::plugin);
+//! # app.update();
 //! ```
 //!
 //! 3. Play audio:
 //!
-//! ```rust,ignore
+//! ```
+//! # use bevy::prelude::*;
+//! # use msg_seedling::prelude::*;
+//! # #[derive(Component, Clone, Copy, Default, Debug, PartialEq, Eq, Hash, Reflect)]
+//! # #[reflect(Component)]
+//! # enum Sound { #[default] Sfx, Music }
+//! # #[derive(Resource, Clone, Default)]
+//! # struct GameAudioConfig;
+//! # impl AudioConfig for GameAudioConfig {
+//! #     fn master_volume(&self) -> f32 { 1.0 }
+//! # }
+//! # impl AudioCategory for Sound {
+//! #     type Config = GameAudioConfig;
+//! #     fn volume(&self, _config: &GameAudioConfig) -> f32 { 1.0 }
+//! # }
 //! fn play_sounds(mut writer: MessageWriter<PlayAudio<Sound>>) {
+//!     # let sfx_handle: Handle<AudioSample> = Handle::default();
+//!     # let music_handle = sfx_handle.clone();
+//!     # let step_handle = sfx_handle.clone();
+//!     # let explosion_handle = sfx_handle.clone();
+//!     # let player_entity = Entity::from_bits(1);
 //!     // One-shot with default randomization
 //!     writer.write(PlayAudio::new(sfx_handle, Sound::Sfx));
 //!
@@ -78,6 +118,11 @@
 //!     // Spatial at a world position
 //!     writer.write(PlayAudio::new(explosion_handle, Sound::Sfx).at(Vec2::new(100.0, 50.0)));
 //! }
+//! # let mut app = App::new();
+//! # app.add_plugins(MinimalPlugins);
+//! # app.add_message::<PlayAudio<Sound>>();
+//! # app.add_systems(Update, play_sounds);
+//! # app.update();
 //! ```
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -94,13 +139,13 @@ mod volume;
 
 #[cfg(not(target_arch = "wasm32"))]
 pub use device_follow::FollowDefaultAudioDevice;
-pub use fade::{FadeInAudio, FadeOutAudio};
+pub use fade::{FadeInAudio, FadeOutAudio, FadeSystems};
 pub use messages::{FadeAudio, PlayAudio, SpatialPosition, StopAudio};
 pub use randomization::{DefaultRandomization, Randomization};
 pub use traits::{AudioCategory, AudioConfig};
 pub use virtual_queue::{
-    Audible, PlayQueuedAudio, Retiring, SignificanceEntry, VirtualSound, VirtualVoiceBudget,
-    VirtualVoiceQueuePlugin, VoiceDecision, rank_by_significance,
+    Audible, PlayQueuedAudio, Retiring, SignificanceEntry, StopQueuedAudio, VirtualSound,
+    VirtualVoiceBudget, VirtualVoiceQueuePlugin, VoiceDecision, rank_by_significance,
 };
 
 use bevy::prelude::*;
@@ -119,10 +164,30 @@ use bevy_seedling::prelude::*;
 ///
 /// # Configuration
 ///
-/// ```rust,ignore
+/// ```
+/// # use bevy::prelude::*;
+/// # use msg_seedling::prelude::*;
+/// # #[derive(Component, Clone, Copy, Default, Debug, PartialEq, Eq, Hash, Reflect)]
+/// # #[reflect(Component)]
+/// # enum Sound { #[default] Sfx }
+/// # #[derive(Resource, Clone, Default)]
+/// # struct GameAudioConfig;
+/// # impl AudioConfig for GameAudioConfig {
+/// #     fn master_volume(&self) -> f32 { 1.0 }
+/// # }
+/// # impl AudioCategory for Sound {
+/// #     type Config = GameAudioConfig;
+/// #     fn volume(&self, _config: &GameAudioConfig) -> f32 { 1.0 }
+/// # }
+/// # let mut app = App::new();
+/// # app.add_plugins(MinimalPlugins);
+/// # app.init_resource::<GameAudioConfig>();
 /// // Default: ±20% randomization for both volume and speed
 /// app.add_plugins(MsgSeedlingPlugin::<Sound>::default());
 ///
+/// # let mut app = App::new();
+/// # app.add_plugins(MinimalPlugins);
+/// # app.init_resource::<GameAudioConfig>();
 /// // Custom randomization defaults and spatial scale
 /// app.add_plugins(
 ///     MsgSeedlingPlugin::<Sound>::new()
@@ -218,7 +283,7 @@ pub mod prelude {
     pub use crate::randomization::{DefaultRandomization, Randomization};
     pub use crate::traits::{AudioCategory, AudioConfig};
     pub use crate::virtual_queue::{
-        Audible, PlayQueuedAudio, Retiring, VirtualSound, VirtualVoiceBudget,
+        Audible, PlayQueuedAudio, Retiring, StopQueuedAudio, VirtualSound, VirtualVoiceBudget,
         VirtualVoiceQueuePlugin,
     };
 

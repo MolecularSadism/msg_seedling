@@ -3,11 +3,26 @@ use bevy::prelude::*;
 /// Base trait for audio categories that provide volume multipliers.
 ///
 /// Games implement this for their own audio category enum. Each variant
-/// maps to a volume level from the configuration resource.
+/// maps to a volume level from the configuration resource. Categories must
+/// derive `Reflect` so components generic over them (e.g.
+/// [`VirtualSound`](crate::virtual_queue::VirtualSound)) can be registered
+/// for reflection.
 ///
 /// # Example
 ///
-/// ```rust,ignore
+/// ```
+/// # use bevy::prelude::*;
+/// # use msg_seedling::prelude::*;
+/// # #[derive(Resource, Clone, Default)]
+/// # pub struct GameAudioConfig {
+/// #     pub music: f32,
+/// #     pub sfx: f32,
+/// #     pub ambience: f32,
+/// #     pub ui: f32,
+/// # }
+/// # impl AudioConfig for GameAudioConfig {
+/// #     fn master_volume(&self) -> f32 { 1.0 }
+/// # }
 /// #[derive(Component, Clone, Copy, Default, Debug, PartialEq, Eq, Hash, Reflect)]
 /// #[reflect(Component)]
 /// pub enum Sound {
@@ -29,6 +44,10 @@ use bevy::prelude::*;
 ///         }
 ///     }
 /// }
+/// #
+/// # let config = GameAudioConfig { music: 0.5, ..Default::default() };
+/// # assert_eq!(Sound::Music.volume(&config), 0.5);
+/// # assert_eq!(Sound::Sfx.volume(&config), 0.0);
 /// ```
 pub trait AudioCategory:
     Component
@@ -39,6 +58,8 @@ pub trait AudioCategory:
     + PartialEq
     + Eq
     + std::hash::Hash
+    + bevy::reflect::Reflectable
+    + FromReflect
     + Send
     + Sync
     + 'static
@@ -56,7 +77,9 @@ pub trait AudioCategory:
 ///
 /// # Example
 ///
-/// ```rust,ignore
+/// ```
+/// # use bevy::prelude::*;
+/// # use msg_seedling::prelude::*;
 /// #[derive(Resource, Clone, Default, Reflect)]
 /// #[reflect(Resource)]
 /// pub struct GameAudioConfig {
@@ -70,6 +93,10 @@ pub trait AudioCategory:
 ///     fn master_volume(&self) -> f32 { self.master }
 ///     fn is_muted(&self) -> bool { self.muted }
 /// }
+/// #
+/// # let config = GameAudioConfig { master: 0.8, muted: true, ..Default::default() };
+/// # assert_eq!(config.master_volume(), 0.8);
+/// # assert_eq!(config.effective_volume(), 0.0);
 /// ```
 pub trait AudioConfig: Resource + Clone + Default + Send + Sync + 'static {
     /// Returns the master volume level (0.0–1.0).
