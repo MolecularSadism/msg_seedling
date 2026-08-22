@@ -116,6 +116,9 @@ use bevy::prelude::*;
 use bevy_seedling::pool::label::PoolLabelContainer;
 use bevy_seedling::pool::{CompletionReason, Sampler};
 use bevy_seedling::prelude::*;
+// Explicit: with bevy's `bevy_audio` feature on, `bevy::prelude` exports a
+// `PlaybackSettings` of its own and the two globs would otherwise resolve to it.
+use bevy_seedling::prelude::PlaybackSettings;
 use bevy_seedling::sample::{AudioSample, QueuedSample};
 
 use crate::fade::{FadeInAudio, FadeOutAudio, FadeSystems};

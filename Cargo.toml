@@ -1,6 +1,6 @@
 [package]
 name = "msg_seedling"
-version = "0.3.0"
+version = "0.3.1"
 edition = "2024"
 authors = ["ffmulks <63452434+ffmulks@users.noreply.github.com>"]
 description = "A seedling-powered audio management crate for Bevy games with category-based volume, spatial audio, and randomization"

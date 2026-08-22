@@ -124,7 +124,23 @@
 //! # app.add_systems(Update, play_sounds);
 //! # app.update();
 //! ```
+//!
+//! ## Bevy's own audio stack
+//!
+//! Bevy's `bevy_audio` feature comes along with its `2d`, `3d` and `ui` feature
+//! groups, so `DefaultPlugins` usually carries `AudioPlugin` whether or not an
+//! app wants it. Nothing here routes through it — every sound is a
+//! `bevy_seedling` sample — so it is dead weight at best: the two stacks each
+//! open an OS output stream and register competing loaders for `ogg`/`wav`/`mp3`,
+//! and on Linux they pull in two `alsa-sys` majors that cannot link together.
+//! Turn bevy's `bevy_audio` feature off; while it is on, build `DefaultPlugins`
+//! with `.disable::<bevy::audio::AudioPlugin>()`.
+//!
+//! This crate stays buildable either way — its imports name `bevy_seedling`'s
+//! types explicitly wherever `bevy::prelude` would export the same name — and
+//! [`BevyAudioGuardPlugin`] warns at startup when `AudioPlugin` is live anyway.
 
+pub mod bevy_audio_guard;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod device_follow;
 pub mod fade;
@@ -137,6 +153,7 @@ mod traits;
 pub mod virtual_queue;
 mod volume;
 
+pub use bevy_audio_guard::BevyAudioGuardPlugin;
 #[cfg(not(target_arch = "wasm32"))]
 pub use device_follow::FollowDefaultAudioDevice;
 pub use fade::{FadeInAudio, FadeOutAudio, FadeSystems};
@@ -157,6 +174,9 @@ use bevy_seedling::prelude::*;
 ///
 /// **Important:** You must also add `SeedlingPlugin::default()` (or your chosen backend)
 /// before adding this plugin.
+///
+/// Also adds [`BevyAudioGuardPlugin`], which warns when Bevy's own `AudioPlugin`
+/// is running alongside `bevy_seedling`.
 ///
 /// # Type Parameters
 ///
@@ -241,6 +261,11 @@ impl<C: AudioCategory> MsgSeedlingPlugin<C> {
 
 impl<C: AudioCategory> Plugin for MsgSeedlingPlugin<C> {
     fn build(&self, app: &mut App) {
+        // One guard per app, however many category plugins are added.
+        if !app.is_plugin_added::<BevyAudioGuardPlugin>() {
+            app.add_plugins(BevyAudioGuardPlugin);
+        }
+
         // Insert resources
         app.insert_resource(self.default_randomization.clone());
 
@@ -276,6 +301,7 @@ pub mod audio_systems {
 /// Prelude module for convenient imports.
 pub mod prelude {
     pub use crate::MsgSeedlingPlugin;
+    pub use crate::bevy_audio_guard::BevyAudioGuardPlugin;
     #[cfg(not(target_arch = "wasm32"))]
     pub use crate::device_follow::FollowDefaultAudioDevice;
     pub use crate::fade::{FadeInAudio, FadeOutAudio};
