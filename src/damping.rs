@@ -535,7 +535,11 @@ pub fn apply_sound_damping<C: AudioCategory>(
         }
 
         if let (Some(base_pitch), Some(mut settings)) = (base_pitch, settings) {
-            let speed = base_pitch.0 * f64::from(damping.speed);
+            // `PlaybackSettings::speed` is `f32` in some firewheel releases
+            // admitted by the bevy_seedling 0.7 range and `f64` in others;
+            // compute in f64 and cast into whichever the resolver picked.
+            #[allow(clippy::unnecessary_cast)]
+            let speed = (base_pitch.0 * f64::from(damping.speed)) as _;
             if settings.speed != speed {
                 settings.speed = speed;
             }
