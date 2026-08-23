@@ -141,6 +141,7 @@
 //! [`BevyAudioGuardPlugin`] warns at startup when `AudioPlugin` is live anyway.
 
 pub mod bevy_audio_guard;
+pub mod damping;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod device_follow;
 pub mod ducking;
@@ -156,6 +157,10 @@ pub mod virtual_queue;
 mod volume;
 
 pub use bevy_audio_guard::BevyAudioGuardPlugin;
+pub use damping::{
+    ActiveField, BasePitch, DampingPlugin, DampingTargets, OPEN_CUTOFF_HZ, SelfDrivenVolume,
+    SoundDamping, SoundDampingField, UndampedSound, apply_sound_damping, nearest_listener,
+};
 #[cfg(not(target_arch = "wasm32"))]
 pub use device_follow::FollowDefaultAudioDevice;
 pub use ducking::{DuckingEnvelope, Ducks, tick_ducking_envelope};
@@ -171,6 +176,12 @@ pub use virtual_queue::{
 
 use bevy::prelude::*;
 use bevy_seedling::prelude::*;
+
+/// System set containing the config-driven volume-update systems, so other
+/// volume writers (e.g. [`damping::apply_sound_damping`]) can order after
+/// them and keep the last word within one frame.
+#[derive(SystemSet, Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct VolumeSystems;
 
 /// Main plugin for `msg_seedling`.
 ///
@@ -289,8 +300,11 @@ impl<C: AudioCategory> Plugin for MsgSeedlingPlugin<C> {
                 handlers::handle_play_audio::<C>,
                 handlers::handle_stop_audio::<C>,
                 handlers::handle_fade_audio::<C>,
-                volume::update_master_volume::<C>.run_if(resource_changed::<C::Config>),
-                volume::update_category_volumes::<C>.run_if(resource_changed::<C::Config>),
+                (
+                    volume::update_master_volume::<C>.run_if(resource_changed::<C::Config>),
+                    volume::update_category_volumes::<C>.run_if(resource_changed::<C::Config>),
+                )
+                    .in_set(VolumeSystems),
             ),
         );
     }
@@ -306,6 +320,10 @@ pub mod audio_systems {
 pub mod prelude {
     pub use crate::MsgSeedlingPlugin;
     pub use crate::bevy_audio_guard::BevyAudioGuardPlugin;
+    pub use crate::damping::{
+        BasePitch, DampingPlugin, DampingTargets, SelfDrivenVolume, SoundDamping,
+        SoundDampingField, UndampedSound,
+    };
     #[cfg(not(target_arch = "wasm32"))]
     pub use crate::device_follow::FollowDefaultAudioDevice;
     pub use crate::ducking::{DuckingEnvelope, Ducks};

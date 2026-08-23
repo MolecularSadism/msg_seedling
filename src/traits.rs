@@ -69,6 +69,16 @@ pub trait AudioCategory:
 
     /// Returns the volume multiplier for this category (0.0–1.0).
     fn volume(&self, config: &Self::Config) -> f32;
+
+    /// Whether sounds of this category may be damped by a
+    /// [`SoundDampingField`](crate::damping::SoundDampingField) at all.
+    ///
+    /// Interface audio is the classic exemption: a menu click is not an
+    /// event in the world, so a field in the world does not get to muffle
+    /// it. Defaults to `true`.
+    fn is_dampable(&self) -> bool {
+        true
+    }
 }
 
 /// Trait for audio configuration resources.
