@@ -203,7 +203,10 @@ impl<C: AudioCategory> StopAudio<C> {
 
 /// Message to fade out audio by category.
 ///
-/// Uses seedling's `VolumeFade` for smooth audio-thread fading.
+/// Attaches a [`FadeOutAudio`](crate::fade::FadeOutAudio) that ramps each
+/// matching sound to silence on the audio thread and keeps the entity; the
+/// fade component marks the sound so the crate's other volume writers leave
+/// its node alone for the fade's duration.
 ///
 /// # Examples
 ///

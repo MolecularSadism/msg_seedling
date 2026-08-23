@@ -42,11 +42,17 @@
 //!
 //! # Scope
 //!
-//! This queue is independent of [`PlayAudio`](crate::PlayAudio),
-//! [`StopAudio`](crate::StopAudio), [`FadeAudio`](crate::FadeAudio), and the
-//! plugin's per-category volume-update systems — a promoted entry does not
-//! carry the bare `C` component those systems match on, so it is stopped and
-//! faded through [`StopQueuedAudio`] instead. Significance tracks the
+//! A promoted entry carries the bare `C` component for as long as it holds a
+//! real voice, so the crate's per-sound category systems reach queue voices
+//! like any other sound of the category: [`damping`](crate::damping) fields
+//! and the [`ducking`](crate::ducking) envelope, and — when
+//! [`MsgSeedlingPlugin`](crate::MsgSeedlingPlugin) is added for the same `C`
+//! — [`StopAudio`](crate::StopAudio), [`FadeAudio`](crate::FadeAudio), and
+//! the config-driven volume rewrites too. Waiting (virtual) entries carry no
+//! `C`, and a demoted loop sheds it along with its voice, so prefer
+//! [`StopQueuedAudio`] for queue entries: it is the only stop that also
+//! reaches the waiting ones, and it fades audible ones out through the
+//! queue's own crossfade instead of cutting them. Significance tracks the
 //! category volume from `C::Config` live: a config change re-ranks waiting
 //! and audible entries on the next frame, and promotions fade in at the
 //! freshly computed volume.
@@ -305,13 +311,16 @@ pub struct PlayQueuedAudio<C: AudioCategory> {
     /// is dropped at the cap. `None` (the default) never caps.
     pub max_per_frame: Option<usize>,
     /// Minimum time since this same sample was last admitted; a request
-    /// arriving sooner is dropped. `None` (the default) never limits.
+    /// arriving sooner is dropped. Only admissions that themselves set an
+    /// interval are tracked — interval-less admissions of the sample do not
+    /// reset the clock, which also keeps the bookkeeping bounded. `None`
+    /// (the default) never limits.
     pub min_repeat_interval: Option<Duration>,
     /// Maximum distance from the nearest spatial listener at which this
     /// request is worth admitting; a positioned request farther away is
     /// culled. Requests without a [`PlayQueuedAudio::position`], and apps
     /// without a listener, are never culled. `None` (the default) never
-    /// culls.
+    /// culls. [`Self::with_max_distance`] sanitizes the value.
     pub max_distance: Option<f32>,
 }
 
@@ -383,7 +392,8 @@ impl<C: AudioCategory> PlayQueuedAudio<C> {
         self
     }
 
-    /// Sets the minimum time since this same sample was last admitted.
+    /// Sets the minimum time since this same sample was last admitted —
+    /// measured against previous admissions that themselves set an interval.
     #[must_use]
     pub fn with_min_repeat_interval(mut self, interval: Duration) -> Self {
         self.min_repeat_interval = Some(interval);
@@ -391,10 +401,12 @@ impl<C: AudioCategory> PlayQueuedAudio<C> {
     }
 
     /// Culls the request when its position is farther than this from the
-    /// nearest spatial listener.
+    /// nearest spatial listener. Sanitized like the crate's other numeric
+    /// inputs: a non-finite distance is discarded (never culls), a negative
+    /// one clamps to `0.0`.
     #[must_use]
     pub fn with_max_distance(mut self, max_distance: f32) -> Self {
-        self.max_distance = Some(max_distance);
+        self.max_distance = max_distance.is_finite().then_some(max_distance.max(0.0));
         self
     }
 }
@@ -516,9 +528,17 @@ impl<C: AudioCategory> Plugin for VirtualVoiceQueuePlugin<C> {
 
 /// Per-category admission bookkeeping: when each sample was last admitted,
 /// for [`PlayQueuedAudio::min_repeat_interval`].
+///
+/// Bounded however many distinct samples stream through a session: only
+/// admissions that carry an interval are recorded, and once the map grows
+/// past a threshold, entries older than the longest interval seen — too old
+/// to ever block a request again — are pruned before recording more.
 #[derive(Resource)]
 pub(crate) struct AdmissionState<C: AudioCategory> {
     last_admitted: bevy::platform::collections::HashMap<AssetId<AudioSample>, Duration>,
+    /// The longest interval any recorded admission carried; the prune
+    /// horizon.
+    longest_interval: Duration,
     _phantom: core::marker::PhantomData<C>,
 }
 
@@ -526,8 +546,28 @@ impl<C: AudioCategory> Default for AdmissionState<C> {
     fn default() -> Self {
         Self {
             last_admitted: Default::default(),
+            longest_interval: Duration::ZERO,
             _phantom: core::marker::PhantomData,
         }
+    }
+}
+
+impl<C: AudioCategory> AdmissionState<C> {
+    /// Recorded admissions beyond this many trigger a prune of entries past
+    /// the horizon before the next is recorded.
+    const PRUNE_THRESHOLD: usize = 64;
+
+    /// Records an admission of `id` at `now` under `interval`.
+    fn record(&mut self, id: AssetId<AudioSample>, now: Duration, interval: Duration) {
+        self.longest_interval = self.longest_interval.max(interval);
+        if self.last_admitted.len() >= Self::PRUNE_THRESHOLD
+            && !self.last_admitted.contains_key(&id)
+        {
+            let horizon = self.longest_interval;
+            self.last_admitted
+                .retain(|_, last| now.saturating_sub(*last) < horizon);
+        }
+        self.last_admitted.insert(id, now);
     }
 }
 
@@ -601,7 +641,9 @@ fn enqueue_queued_audio<C: AudioCategory>(
 
         admitted_this_frame += 1;
         *admitted_per_handle.entry(id).or_insert(0) += 1;
-        admission.last_admitted.insert(id, now);
+        if let Some(interval) = msg.min_repeat_interval {
+            admission.record(id, now, interval);
+        }
         commands.spawn(VirtualSound {
             handle: msg.handle.clone(),
             category: msg.category,
@@ -776,7 +818,9 @@ fn rank_virtual_voices<C: AudioCategory>(
 /// Gives an entry a real voice. `SamplePriority` is inserted at the budget's
 /// elevated value on every promotion, overwriting the `SamplePriority(0)` a
 /// demotion drops the entry to, so a re-promoted loop defends its voice
-/// again.
+/// again. The bare `C` component rides along so per-sound category systems
+/// (damping, ducking, the config-driven volume rewrites) see the voice;
+/// [`release_voice`] strips it with the rest of the promotion.
 fn promote<C: AudioCategory>(
     commands: &mut Commands,
     entity: Entity,
@@ -792,6 +836,7 @@ fn promote<C: AudioCategory>(
     let mut ec = commands.entity(entity);
     ec.insert((
         player,
+        sound.category,
         // `OnComplete::Remove` keeps the entity when seedling ends the voice
         // (steal, queue expiry, one-shot completion) so `reclaim_lost_voices`
         // can apply the queue's own policy.
@@ -843,7 +888,7 @@ fn finish_demotions<C: AudioCategory>(
     >,
 ) {
     for (entity, has_sampler) in &finished {
-        release_voice(&mut commands, entity, has_sampler);
+        release_voice::<C>(&mut commands, entity, has_sampler);
     }
 }
 
@@ -859,16 +904,16 @@ fn reclaim_lost_voices<C: AudioCategory>(
 ) {
     for (entity, sound, has_sampler) in &lost {
         if sound.looping {
-            release_voice(&mut commands, entity, has_sampler);
+            release_voice::<C>(&mut commands, entity, has_sampler);
         } else {
             commands.entity(entity).despawn();
         }
     }
 }
 
-/// Strips everything a promotion added, leaving a bare [`VirtualSound`]
-/// entry eligible for re-promotion.
-fn release_voice(commands: &mut Commands, entity: Entity, has_sampler: bool) {
+/// Strips everything a promotion added — the bare `C` component included —
+/// leaving a bare [`VirtualSound`] entry eligible for re-promotion.
+fn release_voice<C: AudioCategory>(commands: &mut Commands, entity: Entity, has_sampler: bool) {
     // A live sampler needs seedling's completion observer (when
     // `SeedlingPlugin` is present) to release it and strip its private
     // bookkeeping. On the reclaim path seedling already completed the voice
@@ -886,6 +931,7 @@ fn release_voice(commands: &mut Commands, entity: Entity, has_sampler: bool) {
         .despawn_related::<SampleEffects>()
         .remove_with_requires::<SamplePlayer>()
         .remove::<(
+            C,
             Sampler,
             QueuedSample,
             AudioEvents,
@@ -1801,6 +1847,106 @@ mod tests {
         );
         app.update_n(1);
         assert_eq!(entry_count(&mut app), 2);
+    }
+
+    #[test]
+    fn with_max_distance_sanitizes_hostile_values() {
+        let nan = PlayQueuedAudio::new(handle(1), TestSound::Sfx).with_max_distance(f32::NAN);
+        assert_eq!(nan.max_distance, None, "a non-finite distance never culls");
+
+        let negative = PlayQueuedAudio::new(handle(1), TestSound::Sfx).with_max_distance(-5.0);
+        assert_eq!(negative.max_distance, Some(0.0));
+    }
+
+    fn recorded_admissions(app: &App) -> usize {
+        app.world()
+            .resource::<AdmissionState<TestSound>>()
+            .last_admitted
+            .len()
+    }
+
+    #[test]
+    fn admission_bookkeeping_stays_bounded() {
+        let mut app = queue_app(VirtualVoiceBudget::new(0));
+
+        // Interval-less admissions are not recorded at all.
+        for id in 1..=8 {
+            app.world_mut()
+                .write_message(PlayQueuedAudio::new(handle(id), TestSound::Sfx).looping());
+        }
+        app.update_n(1);
+        assert_eq!(recorded_admissions(&app), 0);
+
+        // Recorded admissions past the prune threshold shed every entry too
+        // old to block a request again.
+        for id in 1..=80 {
+            app.world_mut().write_message(
+                PlayQueuedAudio::new(handle(id), TestSound::Sfx)
+                    .looping()
+                    .with_min_repeat_interval(Duration::from_millis(1)),
+            );
+        }
+        app.update_n(1);
+        assert_eq!(recorded_admissions(&app), 80);
+
+        // A frame later everything recorded is older than its interval; the
+        // next recorded admission prunes the lot.
+        app.update_n(1);
+        app.world_mut().write_message(
+            PlayQueuedAudio::new(handle(1000), TestSound::Sfx)
+                .looping()
+                .with_min_repeat_interval(Duration::from_millis(1)),
+        );
+        app.update_n(1);
+        assert_eq!(recorded_admissions(&app), 1);
+    }
+
+    #[test]
+    fn promoted_voices_are_reached_by_ducking() {
+        use crate::damping::DampingPlugin;
+        use crate::ducking::{DuckingEnvelope, Ducks};
+
+        let mut app = queue_app(VirtualVoiceBudget::new(1));
+        app.add_plugins(DampingPlugin::<TestSound>::default());
+        app.world_mut()
+            .write_message(PlayQueuedAudio::new(handle(1), TestSound::Sfx).looping());
+        app.update_n(1);
+
+        let world = app.world_mut();
+        let voice = world
+            .query_filtered::<Entity, With<Audible>>()
+            .single(world)
+            .expect("promoted voice");
+        assert!(
+            app.world().get::<TestSound>(voice).is_some(),
+            "promotion inserts the bare category component"
+        );
+
+        // Stand in for the promotion fade completing — without an audio
+        // context it never resolves — by removing its marker and settling
+        // the node at the fade's target.
+        app.world_mut().entity_mut(voice).remove::<FadeInAudio>();
+        let effect = app.world().get::<SampleEffects>(voice).expect("effects")[0];
+        app.world_mut()
+            .get_mut::<VolumeNode>(effect)
+            .expect("volume node")
+            .volume = Volume::Linear(1.0);
+
+        app.world_mut().entity_mut(voice).insert(Ducks);
+        app.world_mut().resource_mut::<DuckingEnvelope>().trigger();
+        app.update_n(5);
+
+        let ducked_gain = app.world().resource::<DuckingEnvelope>().ducked_gain;
+        let volume = app
+            .world()
+            .get::<VolumeNode>(effect)
+            .expect("volume node")
+            .volume
+            .linear();
+        assert!(
+            (volume - ducked_gain).abs() < 1e-6,
+            "the promoted voice ducks with the envelope, got {volume}"
+        );
     }
 
     #[test]

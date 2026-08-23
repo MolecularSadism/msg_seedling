@@ -5,7 +5,7 @@
 //! a transform. A sound it acts on is attenuated on three axes:
 //!
 //! - **volume** — a linear multiplier folded into the sound's volume node, on
-//!   top of the category volume pipeline;
+//!   top of the category volume pipeline and the sound's own spawn volume;
 //! - **cutoff** — the frequency of the sound's low-pass filter, the part that
 //!   actually reads as "muffled": water and dense matter swallow highs long
 //!   before they swallow lows;
@@ -71,6 +71,12 @@ use crate::traits::AudioCategory;
 /// spectrum while still passing through the same filter node.
 pub const OPEN_CUTOFF_HZ: f32 = 20_000.0;
 
+/// Bounds a field's authored playback speed is clamped into when applied,
+/// mirroring [`geometric_lerp`]'s guard on the cutoff: a non-positive speed
+/// has no geometric path from `1.0`.
+const MIN_FIELD_SPEED: f32 = 0.01;
+const MAX_FIELD_SPEED: f32 = 100.0;
+
 /// Which end of the sound's path a field reads.
 ///
 /// A field always damps a sound *once*, whichever endpoints it covers; this
@@ -124,7 +130,8 @@ pub struct SoundDampingField {
     /// spectrum alone; a few hundred hertz is the classic underwater muffle.
     pub cutoff_hz: f32,
     /// Playback-speed multiplier at the centre. Below `1.0` drags the pitch
-    /// down, above `1.0` pushes it up, `1.0` leaves it alone.
+    /// down, above `1.0` pushes it up, `1.0` leaves it alone. Clamped into
+    /// `0.01..=100.0` when applied, guarding non-positive authored values.
     pub speed: f32,
     /// Whose position the field measures.
     pub targets: DampingTargets,
@@ -177,6 +184,36 @@ pub struct UndampedSound;
 #[derive(Component, Reflect, Debug, Default, Clone, Copy)]
 #[reflect(Component)]
 pub struct SelfDrivenVolume;
+
+/// The per-sound share of a damped sound's volume, captured by
+/// [`apply_sound_damping`] the moment damping or ducking first takes hold of
+/// the sound.
+///
+/// The captured value is the volume node's gain with the category volume
+/// divided back out — the multiplier a [`PlayAudio`](crate::PlayAudio)
+/// request baked in at spawn (its `volume`, times any randomization). While
+/// a sound is held, its node is recomputed each frame as `category volume ×
+/// base × damping × duck`, and the release pass restores `category volume ×
+/// base` exactly before dropping this component.
+///
+/// Managed entirely by [`apply_sound_damping`]; hosts read it at most —
+/// there is nothing sensible to insert by hand.
+#[derive(Component, Clone, Copy, Debug, PartialEq)]
+#[component(storage = "SparseSet")]
+pub struct DampedVolumeBase(f32);
+
+/// The per-sound multiplier hiding inside `node_volume`: the node's gain
+/// with the category volume divided back out. A silent or degenerate
+/// category volume has nothing to divide out, so the base falls back to
+/// `1.0` — the same sound a bare config-driven rewrite would produce.
+fn per_sound_base(node_volume: f32, category_volume: f32) -> f32 {
+    if category_volume > 0.0 {
+        let base = node_volume / category_volume;
+        if base.is_finite() { base } else { 1.0 }
+    } else {
+        1.0
+    }
+}
 
 /// The per-sound part of a sound's playback speed, kept on the sound entity.
 ///
@@ -320,7 +357,12 @@ impl SoundDamping {
             self.cutoff_hz
                 .min(geometric_lerp(OPEN_CUTOFF_HZ, field.cutoff_hz, influence));
 
-        let speed = 1.0_f32.lerp(field.speed, influence);
+        // Speed is heard in octaves just like the cutoff, so it interpolates
+        // geometrically too: `1.0 * (speed / 1.0).powf(influence)`.
+        let speed = field
+            .speed
+            .clamp(MIN_FIELD_SPEED, MAX_FIELD_SPEED)
+            .powf(influence);
         if (speed - 1.0).abs() > (self.speed - 1.0).abs() {
             self.speed = speed;
         }
@@ -356,42 +398,65 @@ pub fn nearest_listener(listeners: &[Vec2], centre: Vec2) -> Option<Vec2> {
 /// Applies every [`SoundDampingField`] — and the current [`DuckingEnvelope`]
 /// — to the sounds playing inside them.
 ///
-/// Runs after the config-driven volume systems (see
-/// [`VolumeSystems`](crate::VolumeSystems)), so damping is the last word on
-/// the volume of a sound in a field within the frame. Sounds mid
-/// [`FadeInAudio`]/[`FadeOutAudio`] are skipped: their volume node belongs to
-/// the fade. The duck rides the same write because two systems writing the
-/// same volume nodes on alternate frames would flicker.
-///
 /// With no fields alive and the duck idle the system does nothing, except
 /// for the one frame after the last of them lets go — that pass restores the
-/// sounds it was holding down.
+/// sounds it was holding down and forgets their captured bases.
+///
+/// ## Who owns the volume node
+///
+/// The first time a sound is touched, its per-sound volume (a
+/// [`PlayAudio`](crate::PlayAudio) request's `volume` times any
+/// randomization) is captured by dividing the category volume out of its
+/// node; from then on the node is recomputed every frame as `category volume
+/// × base × damping × duck`, and the release pass restores exactly `category
+/// volume × base`. The system runs after the config-driven volume systems
+/// (see [`VolumeSystems`](crate::VolumeSystems)) and reads the live config,
+/// so while it holds a sound it owns the node: a config change is folded
+/// into the same frame's recompute instead of fighting it — and, unlike a
+/// bare config rewrite, the captured base carries the per-sound volume
+/// across the change.
+///
+/// Sounds mid [`FadeInAudio`]/[`FadeOutAudio`] leave only their volume to
+/// the fade — the filter and pitch axes stay driven, so a fade overlapping
+/// the release pass cannot strand a muffled cutoff or a bent pitch. A fade
+/// also voids any captured base: the fade's landing volume is the sound's
+/// new baseline, re-captured if damping takes hold again. The duck rides the
+/// same volume write because two systems writing the same volume nodes on
+/// alternate frames would flicker.
 pub fn apply_sound_damping<C: AudioCategory>(
+    mut commands: Commands,
     config: Res<C::Config>,
     duck: Res<DuckingEnvelope>,
     q_fields: Query<(&GlobalTransform, &SoundDampingField)>,
     q_listeners: Query<&GlobalTransform, With<SpatialListener2D>>,
     mut q_sounds: Query<
         (
+            Entity,
             Option<&GlobalTransform>,
             &C,
             &SampleEffects,
             Option<&BasePitch>,
+            Option<&DampedVolumeBase>,
             Option<&mut PlaybackSettings>,
             Has<SelfDrivenVolume>,
             Has<Ducks>,
+            Has<FadeInAudio>,
+            Has<FadeOutAudio>,
         ),
-        (
-            With<SamplePlayer>,
-            Without<FadeInAudio>,
-            Without<FadeOutAudio>,
-            Without<UndampedSound>,
-        ),
+        (With<SamplePlayer>, Without<UndampedSound>),
     >,
     mut volume_nodes: Query<&mut VolumeNode>,
     mut low_pass_nodes: Query<&mut LowPassNode>,
     mut was_active: Local<bool>,
 ) {
+    let has_fields = q_fields.iter().any(|(_, field)| field.radius > 0.0);
+    let active = has_fields || !duck.is_idle();
+    if !active && !*was_active {
+        return;
+    }
+    let restoring = !active;
+    *was_active = active;
+
     let listener_positions: Vec<Vec2> = q_listeners
         .iter()
         .map(|transform| transform.translation().truncate())
@@ -406,14 +471,19 @@ pub fn apply_sound_damping<C: AudioCategory>(
         })
         .collect();
 
-    let active = !fields.is_empty() || !duck.is_idle();
-    if !active && !*was_active {
-        return;
-    }
-    *was_active = active;
-
-    for (transform, category, effects, base_pitch, settings, self_driven_volume, ducks) in
-        &mut q_sounds
+    for (
+        entity,
+        transform,
+        category,
+        effects,
+        base_pitch,
+        damped_base,
+        settings,
+        self_driven_volume,
+        ducks,
+        fading_in,
+        fading_out,
+    ) in &mut q_sounds
     {
         if !category.is_dampable() {
             continue;
@@ -428,11 +498,31 @@ pub fn apply_sound_damping<C: AudioCategory>(
             None => SoundDamping::resolve_positionless(&fields),
         };
 
-        if !self_driven_volume && let Ok(mut volume_node) = volume_nodes.get_effect_mut(effects) {
+        let fading = fading_in || fading_out;
+        if !self_driven_volume && fading {
+            // The fade owns the node and lands on a new baseline.
+            if damped_base.is_some() {
+                commands.entity(entity).remove::<DampedVolumeBase>();
+            }
+        } else if !self_driven_volume
+            && let Ok(mut volume_node) = volume_nodes.get_effect_mut(effects)
+        {
+            let category_volume = category.volume(&config);
+            let base = match damped_base {
+                Some(base) => base.0,
+                None => per_sound_base(volume_node.volume.linear(), category_volume),
+            };
             let volume =
-                Volume::Linear(category.volume(&config) * damping.volume * duck.gain_for(ducks));
+                Volume::Linear(category_volume * base * damping.volume * duck.gain_for(ducks));
             if volume_node.volume != volume {
                 volume_node.volume = volume;
+            }
+            if restoring {
+                if damped_base.is_some() {
+                    commands.entity(entity).remove::<DampedVolumeBase>();
+                }
+            } else if damped_base.is_none() {
+                commands.entity(entity).insert(DampedVolumeBase(base));
             }
         }
 
@@ -735,13 +825,22 @@ mod tests {
     }
 
     fn spawn_sound(app: &mut App, category: TestSound, position: Vec2) -> Entity {
+        spawn_sound_with_volume(app, category, position, 1.0)
+    }
+
+    fn spawn_sound_with_volume(
+        app: &mut App,
+        category: TestSound,
+        position: Vec2,
+        volume: f32,
+    ) -> Entity {
         app.world_mut()
             .spawn((
                 SamplePlayer::new(Handle::default()),
                 category,
                 Transform::from_translation(position.extend(0.0)),
                 GlobalTransform::from_translation(position.extend(0.0)),
-                sample_effects![VolumeNode::from_linear(1.0)],
+                sample_effects![VolumeNode::from_linear(volume)],
             ))
             .id()
     }
@@ -757,6 +856,21 @@ mod tests {
             .get(world, effect)
             .expect("effect entity has a VolumeNode");
         node.volume.linear()
+    }
+
+    fn cutoff_of(app: &mut App, entity: Entity) -> f32 {
+        let world = app.world_mut();
+        let effects = world
+            .get::<SampleEffects>(entity)
+            .expect("sound has effects")
+            .iter()
+            .collect::<Vec<_>>();
+        let mut nodes = world.query::<&LowPassNode>();
+        effects
+            .into_iter()
+            .find_map(|effect| nodes.get(world, effect).ok())
+            .expect("effect chain has a LowPassNode")
+            .frequency
     }
 
     #[test]
@@ -811,6 +925,126 @@ mod tests {
         let ducked_gain = app.world().resource::<DuckingEnvelope>().ducked_gain;
         assert!((volume_of(&mut app, ducked) - ducked_gain).abs() < 1e-6);
         assert!((volume_of(&mut app, clear) - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn speed_interpolates_geometrically() {
+        // Two octaves down at the centre: half influence is one octave, not
+        // the linear midpoint 0.625.
+        let damper = field(10.0, 1.0, OPEN_CUTOFF_HZ, 0.25);
+        let damping = damping_at(&damper, Vec2::new(5.0, 0.0));
+        assert!(
+            (damping.speed - 0.5).abs() < 1e-6,
+            "half influence over two octaves should be one octave, got {}",
+            damping.speed
+        );
+
+        // A non-positive authored speed is clamped, never zero or negative.
+        let broken = field(10.0, 1.0, OPEN_CUTOFF_HZ, -3.0);
+        assert!(damping_at(&broken, Vec2::ZERO).speed > 0.0);
+    }
+
+    #[test]
+    fn a_sound_outside_every_field_keeps_its_spawn_volume() {
+        let mut app = damping_app();
+        // A field alive elsewhere makes the system touch every dampable
+        // sound; ones it does not reach must keep their exact spawn volume.
+        spawn_field(
+            &mut app,
+            Vec2::new(500.0, 0.0),
+            field(10.0, 0.0, 400.0, 1.0),
+        );
+        let sound = spawn_sound_with_volume(&mut app, TestSound::World, Vec2::ZERO, 0.3);
+        app.update_n(2);
+        assert!((volume_of(&mut app, sound) - 0.3).abs() < 1e-6);
+
+        // Same for a duck the sound stands clear of (no `Ducks` marker).
+        app.world_mut().resource_mut::<DuckingEnvelope>().trigger();
+        app.update_n(5);
+        assert!((volume_of(&mut app, sound) - 0.3).abs() < 1e-6);
+    }
+
+    #[test]
+    fn a_per_sound_volume_survives_a_damp_and_release_cycle() {
+        let mut app = damping_app();
+        spawn_field(&mut app, Vec2::ZERO, field(10.0, 0.25, 400.0, 1.0));
+        let sound = spawn_sound_with_volume(&mut app, TestSound::World, Vec2::ZERO, 0.3);
+        app.update_n(2);
+        assert!(
+            (volume_of(&mut app, sound) - 0.3 * 0.25).abs() < 1e-6,
+            "the field scales the sound's own volume, not the bare category"
+        );
+
+        // The field collapses: the restore pass returns the exact base.
+        let world = app.world_mut();
+        let mut fields = world.query::<&mut SoundDampingField>();
+        fields.single_mut(world).expect("field exists").radius = 0.0;
+        app.update_n(2);
+        assert!((volume_of(&mut app, sound) - 0.3).abs() < 1e-6);
+    }
+
+    #[test]
+    fn the_duck_scales_the_spawn_volume_and_releases_it() {
+        let mut app = damping_app();
+        let sound = spawn_sound_with_volume(&mut app, TestSound::World, Vec2::ZERO, 0.3);
+        app.world_mut().entity_mut(sound).insert(Ducks);
+
+        app.world_mut().resource_mut::<DuckingEnvelope>().trigger();
+        app.update_n(5);
+        let ducked_gain = app.world().resource::<DuckingEnvelope>().ducked_gain;
+        assert!((volume_of(&mut app, sound) - 0.3 * ducked_gain).abs() < 1e-6);
+
+        // Ride the whole hold and release out; the restore pass returns the
+        // exact spawn volume.
+        app.update_n(60);
+        assert!(app.world().resource::<DuckingEnvelope>().is_idle());
+        assert!((volume_of(&mut app, sound) - 0.3).abs() < 1e-6);
+    }
+
+    #[test]
+    fn a_fade_owns_only_the_volume_axis() {
+        use core::time::Duration;
+
+        let mut app = damping_app();
+        spawn_field(&mut app, Vec2::ZERO, field(10.0, 0.25, 400.0, 0.5));
+        // No fade systems run in this app, so the marker stays put — the
+        // sound is mid-fade for the whole test.
+        let sound = app
+            .world_mut()
+            .spawn((
+                SamplePlayer::new(Handle::default()),
+                TestSound::World,
+                Transform::default(),
+                GlobalTransform::default(),
+                sample_effects![
+                    VolumeNode::from_linear(0.8),
+                    LowPassNode {
+                        frequency: OPEN_CUTOFF_HZ
+                    }
+                ],
+                BasePitch(1.0),
+                PlaybackSettings::default(),
+                FadeOutAudio::new(Duration::from_secs(60)).keep_entity(),
+            ))
+            .id();
+        app.update_n(2);
+
+        // The fade keeps the volume node; filter and pitch still damp.
+        assert!((volume_of(&mut app, sound) - 0.8).abs() < 1e-6);
+        assert!((cutoff_of(&mut app, sound) - 400.0).abs() < 1e-3);
+        let speed = app.world().get::<PlaybackSettings>(sound).unwrap().speed;
+        assert!((speed - 0.5).abs() < 1e-6);
+
+        // The field collapses mid-fade: the restore pass must still reopen
+        // the filter and unbend the pitch.
+        let world = app.world_mut();
+        let mut fields = world.query::<&mut SoundDampingField>();
+        fields.single_mut(world).expect("field exists").radius = 0.0;
+        app.update_n(2);
+        assert!((cutoff_of(&mut app, sound) - OPEN_CUTOFF_HZ).abs() < 1e-3);
+        let speed = app.world().get::<PlaybackSettings>(sound).unwrap().speed;
+        assert!((speed - 1.0).abs() < 1e-6);
+        assert!((volume_of(&mut app, sound) - 0.8).abs() < 1e-6);
     }
 
     #[test]

@@ -404,6 +404,100 @@ mod category_volume_updates {
         assert!((effect_volume(app.world(), fading_in) - 0.4).abs() < f32::EPSILON);
         assert!((effect_volume(app.world(), steady) - 0.9).abs() < f32::EPSILON);
     }
+
+    #[test]
+    fn fade_audio_message_attaches_a_keep_entity_fade() {
+        let mut app = volume_app();
+        let sample = spawn_sample(&mut app, ());
+        let other = app
+            .world_mut()
+            .spawn((
+                TestSound::Music,
+                sample_effects![VolumeNode::from_linear(0.4)],
+            ))
+            .id();
+
+        app.world_mut()
+            .write_message(FadeAudio::new(TestSound::Sfx, 1.0));
+        app.update();
+
+        let fade = app
+            .world()
+            .get::<FadeOutAudio>(sample)
+            .expect("matching sample fades out");
+        assert!(!fade.despawn_on_complete, "the entity outlives the fade");
+        assert!(
+            app.world().get::<FadeOutAudio>(other).is_none(),
+            "other categories are left alone"
+        );
+
+        // While the fade holds the node, config rewrites stand down.
+        app.world_mut().resource_mut::<TestConfig>().sfx = 0.9;
+        app.update();
+        assert!((effect_volume(app.world(), sample) - 0.4).abs() < f32::EPSILON);
+    }
+}
+
+// -- Master volume and the mix fade --
+
+mod master_volume_and_mix_fade {
+    use bevy_seedling::prelude::*;
+
+    use super::*;
+    use crate::mix_fade::{MixFadeState, MixLevel};
+
+    fn master_app() -> (App, Entity) {
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins);
+        app.insert_resource(TestConfig {
+            master: 1.0,
+            ..Default::default()
+        });
+        app.init_resource::<MixFadeState>();
+        app.add_plugins(crate::MsgSeedlingPlugin::<TestSound>::default());
+        let bus = app
+            .world_mut()
+            .spawn((VolumeNode::from_linear(1.0), MainBus))
+            .id();
+        // Flush the initial resource-changed run.
+        app.update();
+        (app, bus)
+    }
+
+    fn bus_volume(app: &App, bus: Entity) -> f32 {
+        app.world()
+            .get::<VolumeNode>(bus)
+            .expect("main bus volume node")
+            .volume
+            .linear()
+    }
+
+    #[test]
+    fn a_config_change_reaches_the_master_bus_at_full() {
+        let (mut app, bus) = master_app();
+        app.world_mut().resource_mut::<TestConfig>().master = 0.4;
+        app.update();
+        assert!((bus_volume(&app, bus) - 0.4).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn a_config_change_does_not_snap_a_faded_out_mix() {
+        let (mut app, bus) = master_app();
+        // The mix is pointed at silence (faded out, or still fading).
+        app.world_mut().resource_mut::<MixFadeState>().target = MixLevel::Silent;
+        app.world_mut().resource_mut::<TestConfig>().master = 0.4;
+        app.update();
+        assert!(
+            (bus_volume(&app, bus) - 1.0).abs() < f32::EPSILON,
+            "the engaged fade owns the bus"
+        );
+
+        // Pointed back at full, config changes land again.
+        app.world_mut().resource_mut::<MixFadeState>().target = MixLevel::Full;
+        app.world_mut().resource_mut::<TestConfig>().set_changed();
+        app.update();
+        assert!((bus_volume(&app, bus) - 0.4).abs() < f32::EPSILON);
+    }
 }
 
 // -- Randomization enum coverage --

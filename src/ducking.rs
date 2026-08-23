@@ -21,12 +21,20 @@
 
 use bevy::prelude::*;
 
+/// Floor for the envelope's timing fields when read: a zero, negative, or
+/// NaN attack, hold, or release still yields a finite rate that snaps to its
+/// target within a frame instead of an inf/NaN one.
+const MIN_SHAPE_SECS: f32 = 1e-4;
+
 /// The one mix-wide ducking envelope.
 ///
 /// `1.0` at rest; pulled toward [`Self::ducked_gain`] while a cue holds it.
 /// The shape parameters are public so a host can tune the sidechain; the
 /// defaults are a felt-but-safe −6 dB dip with a fast attack and slow
-/// release.
+/// release. Because they are freely writable, the shape fields are
+/// sanitized where they are read ([`Self::trigger`] and [`Self::tick`])
+/// rather than at assignment: no configuration can push the gain outside
+/// `0.0..=1.0` or keep [`Self::is_idle`] from ever returning `true`.
 #[derive(Resource, Reflect, Debug, Clone, Copy, PartialEq)]
 #[reflect(Resource)]
 pub struct DuckingEnvelope {
@@ -35,20 +43,24 @@ pub struct DuckingEnvelope {
     /// Seconds of full-depth hold left before the release begins.
     hold_remaining: f32,
     /// Linear gain the routine mix is pulled down to while a cue plays.
+    /// Read clamped to `0.0..=1.0`.
     ///
     /// The default −6 dB (`0.5`): clearly felt, nowhere near a dropout.
     pub ducked_gain: f32,
     /// Seconds to reach [`Self::ducked_gain`] once triggered. Fast, so the
-    /// cue's transient is already standing clear of the bed.
+    /// cue's transient is already standing clear of the bed. Read floored
+    /// just above zero — a non-positive attack snaps.
     pub attack_secs: f32,
     /// Seconds the duck holds at full depth after the most recent trigger.
     /// The hold clock starts once the attack reaches [`Self::ducked_gain`],
     /// so the full depth lasts this long regardless of the attack.
     /// Re-triggering restarts the hold, so a sustained barrage keeps the bed
-    /// down.
+    /// down. Read floored just above zero — a non-positive hold still ducks
+    /// for a single instant.
     pub hold_secs: f32,
     /// Seconds to recover to unity after the hold lapses. Slow enough that
-    /// the bed swells back instead of popping.
+    /// the bed swells back instead of popping. Read floored just above zero
+    /// — a non-positive release snaps.
     pub release_secs: f32,
 }
 
@@ -68,7 +80,7 @@ impl Default for DuckingEnvelope {
 impl DuckingEnvelope {
     /// Starts (or extends) the duck.
     pub fn trigger(&mut self) {
-        self.hold_remaining = self.hold_secs;
+        self.hold_remaining = self.hold_secs.max(MIN_SHAPE_SECS);
     }
 
     /// Whether the envelope is at rest and leaving every sound alone.
@@ -92,16 +104,17 @@ impl DuckingEnvelope {
 
     /// Advances the envelope by `delta_secs`.
     pub fn tick(&mut self, delta_secs: f32) {
+        let ducked = self.ducked_gain.clamp(0.0, 1.0);
         if self.hold_remaining > 0.0 {
-            if self.gain > self.ducked_gain {
+            if self.gain > ducked {
                 // Attack: the hold clock waits until full depth is reached.
-                let attack_rate = (1.0 - self.ducked_gain) / self.attack_secs;
-                self.gain = (self.gain - attack_rate * delta_secs).max(self.ducked_gain);
+                let attack_rate = (1.0 - ducked) / self.attack_secs.max(MIN_SHAPE_SECS);
+                self.gain = (self.gain - attack_rate * delta_secs).max(ducked);
             } else {
                 self.hold_remaining -= delta_secs;
             }
         } else {
-            let release_rate = (1.0 - self.ducked_gain) / self.release_secs;
+            let release_rate = (1.0 - ducked) / self.release_secs.max(MIN_SHAPE_SECS);
             self.gain = (self.gain + release_rate * delta_secs).min(1.0);
         }
     }
@@ -219,6 +232,42 @@ mod tests {
         duck.tick(1.0);
         duck.tick(2.0);
         assert_eq!(duck.gain, 1.0);
+        assert!(duck.is_idle());
+    }
+
+    #[test]
+    fn hostile_shape_values_cannot_wedge_the_envelope() {
+        let mut duck = DuckingEnvelope {
+            ducked_gain: 2.0,
+            attack_secs: 0.0,
+            hold_secs: -1.0,
+            release_secs: 0.0,
+            ..Default::default()
+        };
+        duck.trigger();
+        for _ in 0..8 {
+            duck.tick(0.05);
+            assert!(
+                (0.0..=1.0).contains(&duck.gain()),
+                "gain {} escaped the unit range",
+                duck.gain()
+            );
+        }
+        assert!(duck.is_idle(), "a hostile shape must still come to rest");
+    }
+
+    #[test]
+    fn a_negative_ducked_gain_bottoms_out_at_silence() {
+        let mut duck = DuckingEnvelope {
+            ducked_gain: -0.5,
+            ..Default::default()
+        };
+        duck.trigger();
+        duck.tick(duck.attack_secs);
+        assert_eq!(duck.gain(), 0.0, "the duck stops at silence, not below");
+
+        duck.tick(duck.hold_secs);
+        duck.tick(duck.release_secs);
         assert!(duck.is_idle());
     }
 

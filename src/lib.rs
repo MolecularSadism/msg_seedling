@@ -166,7 +166,7 @@ pub use device_follow::FollowDefaultAudioDevice;
 pub use ducking::{DuckingEnvelope, Ducks, tick_ducking_envelope};
 pub use fade::{FadeInAudio, FadeOutAudio, FadeSystems};
 pub use messages::{FadeAudio, PlayAudio, SpatialPosition, StopAudio};
-pub use mix_fade::{FadeMix, MixFadePlugin, MixLevel, fade_target};
+pub use mix_fade::{FadeMix, MixFadePlugin, MixFadeState, MixLevel, fade_target};
 pub use randomization::{DefaultRandomization, Randomization};
 pub use traits::{AudioCategory, AudioConfig};
 pub use virtual_queue::{
@@ -281,6 +281,10 @@ impl<C: AudioCategory> Plugin for MsgSeedlingPlugin<C> {
             app.add_plugins(BevyAudioGuardPlugin);
         }
 
+        // FadeAudio drives its fades through the shared fade components;
+        // registration is idempotent across category types.
+        crate::fade::plugin(app);
+
         // Insert resources
         app.insert_resource(self.default_randomization.clone());
 
@@ -329,7 +333,7 @@ pub mod prelude {
     pub use crate::ducking::{DuckingEnvelope, Ducks};
     pub use crate::fade::{FadeInAudio, FadeOutAudio};
     pub use crate::messages::{FadeAudio, PlayAudio, SpatialPosition, StopAudio};
-    pub use crate::mix_fade::{FadeMix, MixFadePlugin, MixLevel};
+    pub use crate::mix_fade::{FadeMix, MixFadePlugin, MixFadeState, MixLevel};
     pub use crate::randomization::{DefaultRandomization, Randomization};
     pub use crate::traits::{AudioCategory, AudioConfig};
     pub use crate::virtual_queue::{

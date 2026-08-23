@@ -1,6 +1,9 @@
+use core::time::Duration;
+
 use bevy::prelude::*;
 use bevy_seedling::prelude::*;
 
+use crate::fade::FadeOutAudio;
 use crate::messages::{FadeAudio, PlayAudio, StopAudio};
 use crate::randomization::{DefaultRandomization, resolve_randomization};
 use crate::traits::AudioCategory;
@@ -143,22 +146,27 @@ pub fn handle_stop_audio<C: AudioCategory>(
     }
 }
 
-/// System that handles [`FadeAudio`] messages using seedling's `VolumeFade`.
+/// System that handles [`FadeAudio`] messages by fading matching sounds to
+/// silence through [`FadeOutAudio`](crate::fade::FadeOutAudio).
+///
+/// The fade component (rather than a bare `fade_to`) marks the sound for
+/// the crate's other volume writers: the config-driven rewrites and
+/// [`apply_sound_damping`](crate::damping::apply_sound_damping) leave a
+/// fading sound's volume node alone instead of fighting the in-flight ramp.
+/// The entity is kept once the fade completes, matching the message's
+/// fade-to-silence-in-place semantics.
 pub fn handle_fade_audio<C: AudioCategory>(
+    mut commands: Commands,
     mut messages: MessageReader<FadeAudio<C>>,
-    categorized: Query<(&C, &SampleEffects)>,
-    mut volume_nodes: Query<(&VolumeNode, &mut AudioEvents)>,
+    categorized: Query<(Entity, &C), With<SampleEffects>>,
 ) {
     for msg in messages.read() {
-        for (cat, effects) in &categorized {
-            if *cat == msg.category
-                && let Ok((volume_node, mut events)) = volume_nodes.get_effect_mut(effects)
-            {
-                volume_node.fade_to(
-                    Volume::SILENT,
-                    DurationSeconds(msg.duration_secs as f64),
-                    &mut events,
-                );
+        let duration = Duration::try_from_secs_f32(msg.duration_secs).unwrap_or(Duration::ZERO);
+        for (entity, cat) in &categorized {
+            if *cat == msg.category {
+                commands
+                    .entity(entity)
+                    .insert(FadeOutAudio::new(duration).keep_entity());
             }
         }
     }
