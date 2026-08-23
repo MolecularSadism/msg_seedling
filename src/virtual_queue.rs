@@ -150,6 +150,12 @@ pub struct VirtualVoiceBudget<C: AudioCategory> {
     /// Seedling `SamplePriority` given to promoted voices, so
     /// default-priority (0) one-shots sharing the pool cannot steal them.
     pub sample_priority: i32,
+    /// Global cap on how many requests may be admitted into the queue per
+    /// frame, across every sound. `None` (the default) admits everything.
+    /// Requests past the cap are dropped, not deferred — a one-shot delayed
+    /// a frame would play out of sync with its cause, and its sender can
+    /// re-request.
+    pub max_admissions_per_frame: Option<usize>,
     /// Incumbent bonus: a newcomer must exceed an audible voice's
     /// significance by this factor to displace it. The default `1.25`
     /// (~2 dB) is hysteresis against crossfade flutter when two sounds
@@ -173,6 +179,7 @@ impl<C: AudioCategory> VirtualVoiceBudget<C> {
             crossfade: DEFAULT_CROSSFADE,
             max_wait: DEFAULT_MAX_WAIT,
             sample_priority: DEFAULT_SAMPLE_PRIORITY,
+            max_admissions_per_frame: None,
             displacement_margin: DEFAULT_DISPLACEMENT_MARGIN,
             _phantom: core::marker::PhantomData,
         }
@@ -196,6 +203,13 @@ impl<C: AudioCategory> VirtualVoiceBudget<C> {
     #[must_use]
     pub fn with_sample_priority(mut self, sample_priority: i32) -> Self {
         self.sample_priority = sample_priority;
+        self
+    }
+
+    /// Caps how many requests may be admitted into the queue per frame.
+    #[must_use]
+    pub fn with_max_admissions_per_frame(mut self, cap: usize) -> Self {
+        self.max_admissions_per_frame = Some(cap);
         self
     }
 
@@ -283,6 +297,22 @@ pub struct PlayQueuedAudio<C: AudioCategory> {
     /// by priority; use this for game-meaning importance a raw volume
     /// number can't express (e.g. a story beat's cue over ambient chatter).
     pub priority: f32,
+    /// Cap on live queue entries (virtual or audible, retiring excluded)
+    /// playing this same sample; the request is dropped at the cap.
+    /// `None` (the default) never caps.
+    pub max_concurrent: Option<usize>,
+    /// Cap on admissions of this same sample within one frame; the request
+    /// is dropped at the cap. `None` (the default) never caps.
+    pub max_per_frame: Option<usize>,
+    /// Minimum time since this same sample was last admitted; a request
+    /// arriving sooner is dropped. `None` (the default) never limits.
+    pub min_repeat_interval: Option<Duration>,
+    /// Maximum distance from the nearest spatial listener at which this
+    /// request is worth admitting; a positioned request farther away is
+    /// culled. Requests without a [`PlayQueuedAudio::position`], and apps
+    /// without a listener, are never culled. `None` (the default) never
+    /// culls.
+    pub max_distance: Option<f32>,
 }
 
 impl<C: AudioCategory> PlayQueuedAudio<C> {
@@ -297,6 +327,10 @@ impl<C: AudioCategory> PlayQueuedAudio<C> {
             position: None,
             volume: 1.0,
             priority: 1.0,
+            max_concurrent: None,
+            max_per_frame: None,
+            min_repeat_interval: None,
+            max_distance: None,
         }
     }
 
@@ -332,6 +366,35 @@ impl<C: AudioCategory> PlayQueuedAudio<C> {
     #[must_use]
     pub fn with_priority(mut self, priority: f32) -> Self {
         self.priority = priority;
+        self
+    }
+
+    /// Caps live queue entries playing this same sample.
+    #[must_use]
+    pub fn with_max_concurrent(mut self, max_concurrent: usize) -> Self {
+        self.max_concurrent = Some(max_concurrent);
+        self
+    }
+
+    /// Caps admissions of this same sample within one frame.
+    #[must_use]
+    pub fn with_max_per_frame(mut self, max_per_frame: usize) -> Self {
+        self.max_per_frame = Some(max_per_frame);
+        self
+    }
+
+    /// Sets the minimum time since this same sample was last admitted.
+    #[must_use]
+    pub fn with_min_repeat_interval(mut self, interval: Duration) -> Self {
+        self.min_repeat_interval = Some(interval);
+        self
+    }
+
+    /// Culls the request when its position is farther than this from the
+    /// nearest spatial listener.
+    #[must_use]
+    pub fn with_max_distance(mut self, max_distance: f32) -> Self {
+        self.max_distance = Some(max_distance);
         self
     }
 }
@@ -427,6 +490,7 @@ impl<C: AudioCategory> Plugin for VirtualVoiceQueuePlugin<C> {
         app.register_type::<Audible>();
         app.register_type::<Retiring>();
         app.init_resource::<C::Config>();
+        app.init_resource::<AdmissionState<C>>();
         app.insert_resource(self.budget.clone());
         app.add_message::<PlayQueuedAudio<C>>();
         app.add_message::<StopQueuedAudio<C>>();
@@ -450,12 +514,94 @@ impl<C: AudioCategory> Plugin for VirtualVoiceQueuePlugin<C> {
     }
 }
 
+/// Per-category admission bookkeeping: when each sample was last admitted,
+/// for [`PlayQueuedAudio::min_repeat_interval`].
+#[derive(Resource)]
+pub(crate) struct AdmissionState<C: AudioCategory> {
+    last_admitted: bevy::platform::collections::HashMap<AssetId<AudioSample>, Duration>,
+    _phantom: core::marker::PhantomData<C>,
+}
+
+impl<C: AudioCategory> Default for AdmissionState<C> {
+    fn default() -> Self {
+        Self {
+            last_admitted: Default::default(),
+            _phantom: core::marker::PhantomData,
+        }
+    }
+}
+
 fn enqueue_queued_audio<C: AudioCategory>(
     mut commands: Commands,
     time: Res<Time>,
+    budget: Res<VirtualVoiceBudget<C>>,
+    mut admission: ResMut<AdmissionState<C>>,
     mut messages: MessageReader<PlayQueuedAudio<C>>,
+    existing: Query<&VirtualSound<C>, Without<Retiring>>,
+    q_listeners: Query<&GlobalTransform, With<SpatialListener2D>>,
 ) {
+    let now = time.elapsed();
+    let mut admitted_this_frame = 0usize;
+    let mut admitted_per_handle: bevy::platform::collections::HashMap<AssetId<AudioSample>, usize> =
+        Default::default();
+    // Resolved lazily: most frames have no distance-culled request.
+    let mut listener_positions: Option<Vec<Vec2>> = None;
+
     for msg in messages.read() {
+        // Every admission control defaults to off; a request using none of
+        // them is admitted exactly as before.
+        if let Some(cap) = budget.max_admissions_per_frame
+            && admitted_this_frame >= cap
+        {
+            continue;
+        }
+
+        let id = msg.handle.id();
+        let same_this_frame = admitted_per_handle.get(&id).copied().unwrap_or(0);
+        if let Some(cap) = msg.max_per_frame
+            && same_this_frame >= cap
+        {
+            continue;
+        }
+        if let Some(cap) = msg.max_concurrent {
+            let live = existing
+                .iter()
+                .filter(|sound| sound.handle.id() == id)
+                .count()
+                + same_this_frame;
+            if live >= cap {
+                continue;
+            }
+        }
+        if let Some(interval) = msg.min_repeat_interval
+            && let Some(&last) = admission.last_admitted.get(&id)
+            && now.saturating_sub(last) < interval
+        {
+            continue;
+        }
+        if let Some(max_distance) = msg.max_distance
+            && let Some(position) = msg.position
+        {
+            let listeners = listener_positions.get_or_insert_with(|| {
+                q_listeners
+                    .iter()
+                    .map(|transform| transform.translation().truncate())
+                    .collect()
+            });
+            let position = position.as_vec3().truncate();
+            let culled = listeners
+                .iter()
+                .map(|listener| listener.distance(position))
+                .min_by(f32::total_cmp)
+                .is_some_and(|distance| distance > max_distance);
+            if culled {
+                continue;
+            }
+        }
+
+        admitted_this_frame += 1;
+        *admitted_per_handle.entry(id).or_insert(0) += 1;
+        admission.last_admitted.insert(id, now);
         commands.spawn(VirtualSound {
             handle: msg.handle.clone(),
             category: msg.category,
@@ -464,7 +610,7 @@ fn enqueue_queued_audio<C: AudioCategory>(
             position: msg.position,
             base_volume: sanitize_weight(msg.volume),
             priority: sanitize_weight(msg.priority),
-            requested_at: time.elapsed(),
+            requested_at: now,
         });
     }
 }
@@ -1501,6 +1647,160 @@ mod tests {
                 .collect();
             assert_eq!(survivors, vec![handle(2)], "stop_after={stop_after}");
         }
+    }
+
+    // ==================== Admission controls ====================
+
+    fn entry_count(app: &mut App) -> usize {
+        let world = app.world_mut();
+        world
+            .query::<&VirtualSound<TestSound>>()
+            .iter(world)
+            .count()
+    }
+
+    #[test]
+    fn global_per_frame_budget_caps_admissions() {
+        let mut app = queue_app(VirtualVoiceBudget::new(0).with_max_admissions_per_frame(1));
+        for id in 1..=3 {
+            app.world_mut()
+                .write_message(PlayQueuedAudio::new(handle(id), TestSound::Sfx).looping());
+        }
+        app.update_n(1);
+        assert_eq!(entry_count(&mut app), 1, "two of three dropped this frame");
+
+        // The cap is per frame, not cumulative.
+        app.world_mut()
+            .write_message(PlayQueuedAudio::new(handle(4), TestSound::Sfx).looping());
+        app.update_n(1);
+        assert_eq!(entry_count(&mut app), 2);
+    }
+
+    #[test]
+    fn per_sound_per_frame_cap_only_limits_that_sample() {
+        let mut app = queue_app(VirtualVoiceBudget::new(0));
+        for _ in 0..3 {
+            app.world_mut().write_message(
+                PlayQueuedAudio::new(handle(1), TestSound::Sfx)
+                    .looping()
+                    .with_max_per_frame(1),
+            );
+        }
+        app.world_mut()
+            .write_message(PlayQueuedAudio::new(handle(2), TestSound::Sfx).looping());
+        app.update_n(1);
+
+        let world = app.world_mut();
+        let mut handles: Vec<Handle<AudioSample>> = world
+            .query::<&VirtualSound<TestSound>>()
+            .iter(world)
+            .map(|sound| sound.handle.clone())
+            .collect();
+        handles.sort_by_key(Handle::id);
+        assert_eq!(handles, vec![handle(1), handle(2)]);
+    }
+
+    #[test]
+    fn max_concurrent_counts_live_entries_across_frames() {
+        let mut app = queue_app(VirtualVoiceBudget::new(0));
+        let request = || {
+            PlayQueuedAudio::new(handle(1), TestSound::Sfx)
+                .looping()
+                .with_max_concurrent(1)
+        };
+
+        // Two same-frame requests: the second already sees the first.
+        app.world_mut().write_message(request());
+        app.world_mut().write_message(request());
+        app.update_n(1);
+        assert_eq!(entry_count(&mut app), 1);
+
+        // A later request still sees the live entry.
+        app.world_mut().write_message(request());
+        app.update_n(1);
+        assert_eq!(entry_count(&mut app), 1);
+
+        // Once the entry is gone, the next request is admitted again.
+        app.world_mut()
+            .write_message(StopQueuedAudio::<TestSound>::all());
+        app.update_n(1);
+        app.world_mut().write_message(request());
+        app.update_n(1);
+        assert_eq!(entry_count(&mut app), 1);
+    }
+
+    #[test]
+    fn min_repeat_interval_rejects_rapid_repeats() {
+        let mut app = queue_app(VirtualVoiceBudget::new(0));
+        let request = || {
+            PlayQueuedAudio::new(handle(1), TestSound::Sfx)
+                .looping()
+                .with_min_repeat_interval(Duration::from_millis(100))
+        };
+
+        app.world_mut().write_message(request());
+        app.update_n(1);
+        // Immediately re-requested: inside the interval, dropped.
+        app.world_mut().write_message(request());
+        app.update_n(1);
+        assert_eq!(entry_count(&mut app), 1);
+
+        // Past the interval (fixed steps are ~15.6ms), admitted again.
+        app.update_n(8);
+        app.world_mut().write_message(request());
+        app.update_n(1);
+        assert_eq!(entry_count(&mut app), 2);
+    }
+
+    #[test]
+    fn max_distance_culls_far_requests_when_a_listener_exists() {
+        let mut app = queue_app(VirtualVoiceBudget::new(0));
+        app.world_mut().spawn((
+            SpatialListener2D,
+            Transform::default(),
+            GlobalTransform::default(),
+        ));
+
+        let request = |id: u128, position: Vec2| {
+            PlayQueuedAudio::new(handle(id), TestSound::Sfx)
+                .looping()
+                .at(position)
+                .with_max_distance(100.0)
+        };
+        app.world_mut()
+            .write_message(request(1, Vec2::new(50.0, 0.0)));
+        app.world_mut()
+            .write_message(request(2, Vec2::new(500.0, 0.0)));
+        app.update_n(1);
+
+        let world = app.world_mut();
+        let handles: Vec<Handle<AudioSample>> = world
+            .query::<&VirtualSound<TestSound>>()
+            .iter(world)
+            .map(|sound| sound.handle.clone())
+            .collect();
+        assert_eq!(handles, vec![handle(1)], "the far request is culled");
+    }
+
+    #[test]
+    fn max_distance_never_culls_without_a_listener_or_position() {
+        let mut app = queue_app(VirtualVoiceBudget::new(0));
+
+        // No listener in the world: nothing to measure from, nothing culled.
+        app.world_mut().write_message(
+            PlayQueuedAudio::new(handle(1), TestSound::Sfx)
+                .looping()
+                .at(Vec2::new(5000.0, 0.0))
+                .with_max_distance(10.0),
+        );
+        // A positionless request has nowhere to be measured from either.
+        app.world_mut().write_message(
+            PlayQueuedAudio::new(handle(2), TestSound::Sfx)
+                .looping()
+                .with_max_distance(10.0),
+        );
+        app.update_n(1);
+        assert_eq!(entry_count(&mut app), 2);
     }
 
     #[test]
