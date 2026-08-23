@@ -221,9 +221,13 @@ fn per_sound_base(node_volume: f32, category_volume: f32) -> f32 {
 /// randomized speed record it here, and a [`SoundDampingField`] multiplies
 /// that baseline rather than replacing it. A sound without [`BasePitch`]
 /// keeps whatever speed it was spawned with and is never pitch-bent.
+///
+/// Stored as `f32`, like the damping math it multiplies with: firewheel's
+/// playback speed is `f32` in some releases and `f64` in others, and an
+/// `f32` product widens into either losslessly.
 #[derive(Component, Reflect, Clone, Copy, Debug, PartialEq)]
 #[reflect(Component)]
-pub struct BasePitch(pub f64);
+pub struct BasePitch(pub f32);
 
 impl Default for BasePitch {
     fn default() -> Self {
@@ -537,9 +541,8 @@ pub fn apply_sound_damping<C: AudioCategory>(
         if let (Some(base_pitch), Some(mut settings)) = (base_pitch, settings) {
             // `PlaybackSettings::speed` is `f32` in some firewheel releases
             // admitted by the bevy_seedling 0.7 range and `f64` in others;
-            // compute in f64 and cast into whichever the resolver picked.
-            #[allow(clippy::unnecessary_cast)]
-            let speed = (base_pitch.0 * f64::from(damping.speed)) as _;
+            // an f32 product widens into either losslessly via `Into`.
+            let speed = (base_pitch.0 * damping.speed).into();
             if settings.speed != speed {
                 settings.speed = speed;
             }
