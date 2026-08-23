@@ -143,6 +143,7 @@
 pub mod bevy_audio_guard;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod device_follow;
+pub mod ducking;
 pub mod fade;
 mod handlers;
 mod messages;
@@ -156,6 +157,7 @@ mod volume;
 pub use bevy_audio_guard::BevyAudioGuardPlugin;
 #[cfg(not(target_arch = "wasm32"))]
 pub use device_follow::FollowDefaultAudioDevice;
+pub use ducking::{DuckingEnvelope, Ducks, tick_ducking_envelope};
 pub use fade::{FadeInAudio, FadeOutAudio, FadeSystems};
 pub use messages::{FadeAudio, PlayAudio, SpatialPosition, StopAudio};
 pub use randomization::{DefaultRandomization, Randomization};
@@ -304,6 +306,7 @@ pub mod prelude {
     pub use crate::bevy_audio_guard::BevyAudioGuardPlugin;
     #[cfg(not(target_arch = "wasm32"))]
     pub use crate::device_follow::FollowDefaultAudioDevice;
+    pub use crate::ducking::{DuckingEnvelope, Ducks};
     pub use crate::fade::{FadeInAudio, FadeOutAudio};
     pub use crate::messages::{FadeAudio, PlayAudio, SpatialPosition, StopAudio};
     pub use crate::randomization::{DefaultRandomization, Randomization};
