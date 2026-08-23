@@ -147,6 +147,7 @@ pub mod ducking;
 pub mod fade;
 mod handlers;
 mod messages;
+pub mod mix_fade;
 mod randomization;
 #[cfg(test)]
 mod tests;
@@ -160,6 +161,7 @@ pub use device_follow::FollowDefaultAudioDevice;
 pub use ducking::{DuckingEnvelope, Ducks, tick_ducking_envelope};
 pub use fade::{FadeInAudio, FadeOutAudio, FadeSystems};
 pub use messages::{FadeAudio, PlayAudio, SpatialPosition, StopAudio};
+pub use mix_fade::{FadeMix, MixFadePlugin, MixLevel, fade_target};
 pub use randomization::{DefaultRandomization, Randomization};
 pub use traits::{AudioCategory, AudioConfig};
 pub use virtual_queue::{
@@ -309,6 +311,7 @@ pub mod prelude {
     pub use crate::ducking::{DuckingEnvelope, Ducks};
     pub use crate::fade::{FadeInAudio, FadeOutAudio};
     pub use crate::messages::{FadeAudio, PlayAudio, SpatialPosition, StopAudio};
+    pub use crate::mix_fade::{FadeMix, MixFadePlugin, MixLevel};
     pub use crate::randomization::{DefaultRandomization, Randomization};
     pub use crate::traits::{AudioCategory, AudioConfig};
     pub use crate::virtual_queue::{
