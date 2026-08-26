@@ -12,6 +12,8 @@ use core::time::Duration;
 use bevy::prelude::*;
 use bevy_seedling::prelude::*;
 
+use crate::baseline::BaseVolume;
+
 /// How long past its duration an untriggered fade-out waits for its
 /// `SampleEffects` to resolve before completing without a ramp.
 const UNRESOLVED_EFFECTS_GRACE: Duration = Duration::from_millis(500);
@@ -52,9 +54,12 @@ impl FadeInAudio {
 /// moment purely to schedule completion — the ramp itself always runs on the
 /// audio thread regardless of frame rate. On completion the entity is
 /// despawned, or with [`keep_entity`](Self::keep_entity) only this component
-/// is removed. An entity whose effects never resolve (e.g. its voice was
-/// stolen mid-fade) still completes once its duration plus a grace period
-/// has passed since insertion, so nothing leaks.
+/// is removed, and the surviving entity is left at
+/// [`BaseVolume::SILENT`] so a later config change re-derives the silence
+/// instead of reviving the sound at full category volume. An entity whose
+/// effects never resolve (e.g. its voice was stolen mid-fade) still completes
+/// once its duration plus a grace period has passed since insertion, so
+/// nothing leaks.
 #[derive(Component, Reflect, Debug, Clone)]
 #[reflect(Component)]
 pub struct FadeOutAudio {
@@ -85,8 +90,9 @@ impl FadeOutAudio {
     }
 
     /// Keeps the entity alive after the fade completes instead of despawning
-    /// it — the component removes itself on completion. Useful for silencing
-    /// a looping sound without losing its identity.
+    /// it — the component removes itself on completion and the entity is
+    /// left at [`BaseVolume::SILENT`]. Useful for silencing a looping sound
+    /// without losing its identity.
     #[must_use]
     pub fn keep_entity(mut self) -> Self {
         self.despawn_on_complete = false;
@@ -206,7 +212,13 @@ fn complete_fade_out(commands: &mut Commands, entity: Entity, fade: &FadeOutAudi
     if fade.despawn_on_complete {
         commands.entity(entity).despawn();
     } else {
-        commands.entity(entity).remove::<FadeOutAudio>();
+        // The fade landed the sound on silence deliberately, so silence is
+        // its new baseline: without this the next config change would
+        // recompute the node as `category × 1.0` and bring it back.
+        commands
+            .entity(entity)
+            .remove::<FadeOutAudio>()
+            .insert(BaseVolume::SILENT);
     }
 }
 
@@ -276,6 +288,30 @@ mod tests {
         let steps = steps_past_grace(&app, duration);
         app.update_n(steps);
         assert!(app.world().get_entity(entity).is_err());
+    }
+
+    #[test]
+    fn a_completed_keep_entity_fade_lands_on_silence() {
+        let mut app = fade_app();
+        let duration = Duration::from_millis(10);
+
+        let entity = app
+            .world_mut()
+            .spawn((
+                FadeOutAudio::new(duration).keep_entity(),
+                BaseVolume(0.8),
+                sample_effects![VolumeNode::from_linear(0.8)],
+            ))
+            .id();
+
+        let steps = steps_past_grace(&app, duration);
+        app.update_n(steps);
+        assert_eq!(
+            app.world().get::<BaseVolume>(entity).copied(),
+            Some(BaseVolume::SILENT),
+            "the fade's landing volume is the sound's new baseline, so a later \
+             config change re-derives silence instead of reviving it"
+        );
     }
 
     #[test]

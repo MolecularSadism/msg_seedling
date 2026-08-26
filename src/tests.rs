@@ -335,6 +335,119 @@ fn plugin_custom_randomization() {
     assert_eq!(defaults.speed, None);
 }
 
+// -- Spawn-time baselines --
+
+mod spawned_baselines {
+    use bevy_seedling::prelude::*;
+
+    use super::*;
+    use crate::baseline::{BasePitch, BaseVolume};
+
+    fn play_app() -> App {
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins);
+        app.insert_resource(TestConfig {
+            sfx: 0.8,
+            ..Default::default()
+        });
+        app.add_plugins(crate::MsgSeedlingPlugin::<TestSound>::default());
+        app.update();
+        app
+    }
+
+    /// The one sound the app spawned, with everything a request resolves.
+    fn spawned(app: &mut App) -> (BaseVolume, BasePitch, f64, f32) {
+        let world = app.world_mut();
+        let (base, pitch, settings, effects) = world
+            .query::<(&BaseVolume, &BasePitch, &PlaybackSettings, &SampleEffects)>()
+            .single(world)
+            .expect("exactly one spawned sound");
+        let (base, pitch, speed, effects) = (*base, *pitch, settings.speed, effects.clone());
+        let node_volume = effects
+            .iter()
+            .find_map(|effect| world.get::<VolumeNode>(effect))
+            .expect("volume node effect")
+            .volume
+            .linear();
+        (base, pitch, speed, node_volume)
+    }
+
+    fn exact() -> Randomization {
+        Randomization::VolumeAndSpeed {
+            volume: 0.0,
+            speed: 0.0,
+        }
+    }
+
+    #[test]
+    fn a_request_records_its_own_volume_and_seeds_the_node_with_it() {
+        let mut app = play_app();
+        app.world_mut().write_message(
+            PlayAudio::new(Handle::default(), TestSound::Sfx)
+                .with_volume(0.5)
+                .randomized(exact()),
+        );
+        app.update();
+
+        let (base, pitch, speed, node_volume) = spawned(&mut app);
+        assert_eq!(base, BaseVolume(0.5), "the request's own level is recorded");
+        assert_eq!(pitch, BasePitch(1.0));
+        assert!((speed - 1.0).abs() < f64::EPSILON);
+        assert!(
+            (node_volume - 0.4).abs() < f32::EPSILON,
+            "the node is seeded with category × base, got {node_volume}"
+        );
+    }
+
+    #[cfg(feature = "rand")]
+    #[test]
+    fn randomization_lands_in_the_baselines_rather_than_only_the_node() {
+        let mut app = play_app();
+        app.world_mut().write_message(
+            PlayAudio::new(Handle::default(), TestSound::Sfx).randomized(
+                Randomization::VolumeAndSpeed {
+                    volume: 0.2,
+                    speed: 0.2,
+                },
+            ),
+        );
+        app.update();
+
+        let (base, pitch, speed, node_volume) = spawned(&mut app);
+        assert!(
+            (0.8..=1.2).contains(&base.0),
+            "the drawn volume is the baseline, got {}",
+            base.0
+        );
+        assert!(
+            (0.8..=1.2).contains(&pitch.0),
+            "the drawn speed is the baseline, got {}",
+            pitch.0
+        );
+        assert!(
+            (speed - f64::from(pitch.0)).abs() < 1e-9,
+            "playback speed starts at the pitch baseline, so a damping field \
+             has something to bend from"
+        );
+        assert!((node_volume - 0.8 * base.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn a_hostile_request_volume_silences_rather_than_poisoning_the_mix() {
+        let mut app = play_app();
+        app.world_mut().write_message(
+            PlayAudio::new(Handle::default(), TestSound::Sfx)
+                .with_volume(f32::NAN)
+                .randomized(exact()),
+        );
+        app.update();
+
+        let (base, _, _, node_volume) = spawned(&mut app);
+        assert_eq!(base, BaseVolume::SILENT);
+        assert_eq!(node_volume, 0.0);
+    }
+}
+
 // -- Category volume update tests --
 
 mod category_volume_updates {
@@ -343,6 +456,7 @@ mod category_volume_updates {
     use bevy_seedling::prelude::*;
 
     use super::*;
+    use crate::baseline::BaseVolume;
     use crate::fade::{FadeInAudio, FadeOutAudio};
 
     fn volume_app() -> App {
@@ -403,6 +517,54 @@ mod category_volume_updates {
         assert!((effect_volume(app.world(), fading_out) - 0.4).abs() < f32::EPSILON);
         assert!((effect_volume(app.world(), fading_in) - 0.4).abs() < f32::EPSILON);
         assert!((effect_volume(app.world(), steady) - 0.9).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn a_config_change_keeps_each_sound_s_own_level() {
+        let mut app = volume_app();
+        // Two sounds of one category at different levels — a quiet ambience
+        // bed under a full-volume cue, say.
+        let quiet = spawn_sample(&mut app, BaseVolume(0.25));
+        let full = spawn_sample(&mut app, BaseVolume(1.0));
+
+        app.world_mut().resource_mut::<TestConfig>().sfx = 0.8;
+        app.update();
+
+        assert!(
+            (effect_volume(app.world(), quiet) - 0.2).abs() < f32::EPSILON,
+            "the config change scales the sound's own level, it does not replace it"
+        );
+        assert!((effect_volume(app.world(), full) - 0.8).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn a_sound_without_a_baseline_still_follows_the_category() {
+        let mut app = volume_app();
+        let bare = spawn_sample(&mut app, ());
+
+        app.world_mut().resource_mut::<TestConfig>().sfx = 0.9;
+        app.update();
+
+        // Documented fallback: no `BaseVolume` reads as `1.0`.
+        assert!((effect_volume(app.world(), bare) - 0.9).abs() < f32::EPSILON);
+    }
+
+    /// The other half of this — that a completed keep-entity fade actually
+    /// lands the sound on [`BaseVolume::SILENT`] — is
+    /// `fade::tests::a_completed_keep_entity_fade_lands_on_silence`.
+    #[test]
+    fn a_faded_out_sound_is_not_revived_by_a_config_change() {
+        let mut app = volume_app();
+        let faded = spawn_sample(&mut app, BaseVolume::SILENT);
+
+        app.world_mut().resource_mut::<TestConfig>().sfx = 0.9;
+        app.update();
+
+        assert_eq!(
+            effect_volume(app.world(), faded),
+            0.0,
+            "a volume-slider change must not bring a faded-out sound back"
+        );
     }
 
     #[test]

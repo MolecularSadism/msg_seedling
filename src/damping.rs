@@ -61,6 +61,7 @@
 use bevy::prelude::*;
 use bevy_seedling::prelude::*;
 
+use crate::baseline::{BasePitch, BaseVolume};
 use crate::ducking::{DuckingEnvelope, Ducks};
 use crate::fade::{FadeInAudio, FadeOutAudio};
 use crate::traits::AudioCategory;
@@ -184,56 +185,6 @@ pub struct UndampedSound;
 #[derive(Component, Reflect, Debug, Default, Clone, Copy)]
 #[reflect(Component)]
 pub struct SelfDrivenVolume;
-
-/// The per-sound share of a damped sound's volume, captured by
-/// [`apply_sound_damping`] the moment damping or ducking first takes hold of
-/// the sound.
-///
-/// The captured value is the volume node's gain with the category volume
-/// divided back out — the multiplier a [`PlayAudio`](crate::PlayAudio)
-/// request baked in at spawn (its `volume`, times any randomization). While
-/// a sound is held, its node is recomputed each frame as `category volume ×
-/// base × damping × duck`, and the release pass restores `category volume ×
-/// base` exactly before dropping this component.
-///
-/// Managed entirely by [`apply_sound_damping`]; hosts read it at most —
-/// there is nothing sensible to insert by hand.
-#[derive(Component, Clone, Copy, Debug, PartialEq)]
-#[component(storage = "SparseSet")]
-pub struct DampedVolumeBase(f32);
-
-/// The per-sound multiplier hiding inside `node_volume`: the node's gain
-/// with the category volume divided back out. A silent or degenerate
-/// category volume has nothing to divide out, so the base falls back to
-/// `1.0` — the same sound a bare config-driven rewrite would produce.
-fn per_sound_base(node_volume: f32, category_volume: f32) -> f32 {
-    if category_volume > 0.0 {
-        let base = node_volume / category_volume;
-        if base.is_finite() { base } else { 1.0 }
-    } else {
-        1.0
-    }
-}
-
-/// The per-sound part of a sound's playback speed, kept on the sound entity.
-///
-/// The pitch analogue of a per-sound base volume: sounds spawned at a
-/// randomized speed record it here, and a [`SoundDampingField`] multiplies
-/// that baseline rather than replacing it. A sound without [`BasePitch`]
-/// keeps whatever speed it was spawned with and is never pitch-bent.
-///
-/// Stored as `f32`, like the damping math it multiplies with: firewheel's
-/// playback speed is `f32` in some releases and `f64` in others, and an
-/// `f32` product widens into either losslessly.
-#[derive(Component, Reflect, Clone, Copy, Debug, PartialEq)]
-#[reflect(Component)]
-pub struct BasePitch(pub f32);
-
-impl Default for BasePitch {
-    fn default() -> Self {
-        Self(1.0)
-    }
-}
 
 /// A field paired with how deeply the listener sits in it, resolved once per
 /// frame because it is the same for every sound.
@@ -403,44 +354,44 @@ pub fn nearest_listener(listeners: &[Vec2], centre: Vec2) -> Option<Vec2> {
 /// — to the sounds playing inside them.
 ///
 /// With no fields alive and the duck idle the system does nothing, except
-/// for the one frame after the last of them lets go — that pass restores the
-/// sounds it was holding down and forgets their captured bases.
+/// for the one frame after the last of them lets go — that pass writes every
+/// held sound back to its undamped level.
 ///
 /// ## Who owns the volume node
 ///
-/// The first time a sound is touched, its per-sound volume (a
-/// [`PlayAudio`](crate::PlayAudio) request's `volume` times any
-/// randomization) is captured by dividing the category volume out of its
-/// node; from then on the node is recomputed every frame as `category volume
-/// × base × damping × duck`, and the release pass restores exactly `category
-/// volume × base`. The system runs after the config-driven volume systems
-/// (see [`VolumeSystems`](crate::VolumeSystems)) and reads the live config,
-/// so while it holds a sound it owns the node: a config change is folded
-/// into the same frame's recompute instead of fighting it — and, unlike a
-/// bare config rewrite, the captured base carries the per-sound volume
-/// across the change.
+/// Nobody, exclusively: the node is a product of independently-owned layers
+/// (see [`baseline`](crate::baseline)), and every system that writes it
+/// recomputes the whole product. This one writes
+///
+/// ```text
+/// category volume × BaseVolume × damping × duck
+/// ```
+///
+/// every frame it is active, and the same expression with `damping` and
+/// `duck` at unity on the frame it lets go — which is exactly what the
+/// config-driven write in [`VolumeSystems`](crate::VolumeSystems) produces,
+/// so the hand-off is seamless in both directions. Because it is scheduled
+/// after that set and reads the live config, a settings change made on a
+/// damped frame is folded into the same frame's recompute instead of
+/// fighting it.
 ///
 /// Sounds mid [`FadeInAudio`]/[`FadeOutAudio`] leave only their volume to
 /// the fade — the filter and pitch axes stay driven, so a fade overlapping
-/// the release pass cannot strand a muffled cutoff or a bent pitch. A fade
-/// also voids any captured base: the fade's landing volume is the sound's
-/// new baseline, re-captured if damping takes hold again. The duck rides the
-/// same volume write because two systems writing the same volume nodes on
-/// alternate frames would flicker.
+/// the release pass cannot strand a muffled cutoff or a bent pitch. The duck
+/// rides the same volume write because two systems writing the same volume
+/// nodes on alternate frames would flicker.
 pub fn apply_sound_damping<C: AudioCategory>(
-    mut commands: Commands,
     config: Res<C::Config>,
     duck: Res<DuckingEnvelope>,
     q_fields: Query<(&GlobalTransform, &SoundDampingField)>,
     q_listeners: Query<&GlobalTransform, With<SpatialListener2D>>,
     mut q_sounds: Query<
         (
-            Entity,
             Option<&GlobalTransform>,
             &C,
             &SampleEffects,
+            Option<&BaseVolume>,
             Option<&BasePitch>,
-            Option<&DampedVolumeBase>,
             Option<&mut PlaybackSettings>,
             Has<SelfDrivenVolume>,
             Has<Ducks>,
@@ -458,7 +409,6 @@ pub fn apply_sound_damping<C: AudioCategory>(
     if !active && !*was_active {
         return;
     }
-    let restoring = !active;
     *was_active = active;
 
     let listener_positions: Vec<Vec2> = q_listeners
@@ -476,12 +426,11 @@ pub fn apply_sound_damping<C: AudioCategory>(
         .collect();
 
     for (
-        entity,
         transform,
         category,
         effects,
+        base_volume,
         base_pitch,
-        damped_base,
         settings,
         self_driven_volume,
         ducks,
@@ -502,31 +451,20 @@ pub fn apply_sound_damping<C: AudioCategory>(
             None => SoundDamping::resolve_positionless(&fields),
         };
 
+        // A fade owns the volume node outright for its duration, and a
+        // `SelfDrivenVolume` sound's own system owns it forever; neither is
+        // written here. Both still get the filter and pitch axes below.
         let fading = fading_in || fading_out;
-        if !self_driven_volume && fading {
-            // The fade owns the node and lands on a new baseline.
-            if damped_base.is_some() {
-                commands.entity(entity).remove::<DampedVolumeBase>();
-            }
-        } else if !self_driven_volume
+        if !self_driven_volume
+            && !fading
             && let Ok(mut volume_node) = volume_nodes.get_effect_mut(effects)
         {
-            let category_volume = category.volume(&config);
-            let base = match damped_base {
-                Some(base) => base.0,
-                None => per_sound_base(volume_node.volume.linear(), category_volume),
-            };
-            let volume =
-                Volume::Linear(category_volume * base * damping.volume * duck.gain_for(ducks));
+            let base = base_volume.copied().unwrap_or_default();
+            let volume = Volume::Linear(
+                base.resolve(category.volume(&config)) * damping.volume * duck.gain_for(ducks),
+            );
             if volume_node.volume != volume {
                 volume_node.volume = volume;
-            }
-            if restoring {
-                if damped_base.is_some() {
-                    commands.entity(entity).remove::<DampedVolumeBase>();
-                }
-            } else if damped_base.is_none() {
-                commands.entity(entity).insert(DampedVolumeBase(base));
             }
         }
 
@@ -576,7 +514,7 @@ impl<C: AudioCategory> Plugin for DampingPlugin<C> {
         app.register_type::<DampingTargets>();
         app.register_type::<UndampedSound>();
         app.register_type::<SelfDrivenVolume>();
-        app.register_type::<BasePitch>();
+        crate::baseline::register_types(app);
         app.init_resource::<C::Config>();
         app.add_systems(
             Update,
@@ -835,6 +773,10 @@ mod tests {
         spawn_sound_with_volume(app, category, position, 1.0)
     }
 
+    /// Spawns a sound the way [`handle_play_audio`](crate::audio_systems::handle_play_audio)
+    /// does: a node seeded at `category × base`, and the `base` recorded on
+    /// the entity. The test config puts every category at `1.0`, so the two
+    /// numbers coincide here.
     fn spawn_sound_with_volume(
         app: &mut App,
         category: TestSound,
@@ -845,6 +787,7 @@ mod tests {
             .spawn((
                 SamplePlayer::new(Handle::default()),
                 category,
+                BaseVolume(volume),
                 Transform::from_translation(position.extend(0.0)),
                 GlobalTransform::from_translation(position.extend(0.0)),
                 sample_effects![VolumeNode::from_linear(volume)],
@@ -972,6 +915,26 @@ mod tests {
     }
 
     #[test]
+    fn a_sound_without_a_baseline_reads_as_full() {
+        let mut app = damping_app();
+        spawn_field(&mut app, Vec2::ZERO, field(10.0, 0.25, 400.0, 1.0));
+        // A hand-spawned sound with no `BaseVolume` is documented to read as
+        // `1.0`, so the field scales the bare category volume.
+        let sound = app
+            .world_mut()
+            .spawn((
+                SamplePlayer::new(Handle::default()),
+                TestSound::World,
+                Transform::default(),
+                GlobalTransform::default(),
+                sample_effects![VolumeNode::from_linear(1.0)],
+            ))
+            .id();
+        app.update_n(2);
+        assert!((volume_of(&mut app, sound) - 0.25).abs() < 1e-6);
+    }
+
+    #[test]
     fn a_per_sound_volume_survives_a_damp_and_release_cycle() {
         let mut app = damping_app();
         spawn_field(&mut app, Vec2::ZERO, field(10.0, 0.25, 400.0, 1.0));
@@ -982,7 +945,8 @@ mod tests {
             "the field scales the sound's own volume, not the bare category"
         );
 
-        // The field collapses: the restore pass returns the exact base.
+        // The field collapses: the release pass recomputes `category × base`
+        // with both damping factors back at unity.
         let world = app.world_mut();
         let mut fields = world.query::<&mut SoundDampingField>();
         fields.single_mut(world).expect("field exists").radius = 0.0;

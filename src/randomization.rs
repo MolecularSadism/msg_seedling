@@ -64,10 +64,35 @@ pub fn resolve_randomization(
     }
 }
 
-/// System-local RNG for volume randomization.
+/// Draws `centre` scaled by a random factor in `1 ± deviation`.
 ///
-/// Seedling handles speed randomization via [`RandomPitch`](bevy_seedling::prelude::RandomPitch),
-/// but volume randomization is applied by us at spawn time.
+/// `None` (or a non-positive or non-finite deviation) returns `centre`
+/// untouched, so an unrandomized axis costs nothing and never consumes an RNG
+/// draw. A deviation wider than `1.0` floors the low end at zero rather than
+/// flipping the sign, so the widest possible spread is `0..=2 × centre`.
+///
+/// Used for both axes: volume deviates around the request's own volume,
+/// speed around `1.0`.
+#[cfg(feature = "rand")]
+pub fn deviate(rng: &mut impl rand::Rng, centre: f32, deviation: Option<f32>) -> f32 {
+    let Some(deviation) = deviation.filter(|d| d.is_finite() && *d > 0.0) else {
+        return centre;
+    };
+    let min = centre * (1.0 - deviation).max(0.0);
+    let max = centre * (1.0 + deviation);
+    if min < max {
+        rng.random_range(min..=max)
+    } else {
+        // A zero (or degenerate) centre has nothing to deviate around.
+        min.min(max)
+    }
+}
+
+/// System-local RNG for the crate's spawn-time randomization.
+///
+/// Both axes are drawn here rather than deferring the speed to seedling's
+/// [`RandomPitch`](bevy_seedling::prelude::RandomPitch), so a sound's
+/// [`BasePitch`](crate::BasePitch) is known at spawn instead of a frame later.
 #[cfg(feature = "rand")]
 pub struct AudioRng(pub rand::rngs::SmallRng);
 

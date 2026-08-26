@@ -140,6 +140,7 @@
 //! types explicitly wherever `bevy::prelude` would export the same name — and
 //! [`BevyAudioGuardPlugin`] warns at startup when `AudioPlugin` is live anyway.
 
+pub mod baseline;
 pub mod bevy_audio_guard;
 pub mod damping;
 #[cfg(not(target_arch = "wasm32"))]
@@ -156,10 +157,11 @@ mod traits;
 pub mod virtual_queue;
 mod volume;
 
+pub use baseline::{BasePitch, BaseVolume};
 pub use bevy_audio_guard::BevyAudioGuardPlugin;
 pub use damping::{
-    ActiveField, BasePitch, DampingPlugin, DampingTargets, OPEN_CUTOFF_HZ, SelfDrivenVolume,
-    SoundDamping, SoundDampingField, UndampedSound, apply_sound_damping, nearest_listener,
+    ActiveField, DampingPlugin, DampingTargets, OPEN_CUTOFF_HZ, SelfDrivenVolume, SoundDamping,
+    SoundDampingField, UndampedSound, apply_sound_damping, nearest_listener,
 };
 #[cfg(not(target_arch = "wasm32"))]
 pub use device_follow::FollowDefaultAudioDevice;
@@ -285,6 +287,9 @@ impl<C: AudioCategory> Plugin for MsgSeedlingPlugin<C> {
         // registration is idempotent across category types.
         crate::fade::plugin(app);
 
+        // Every sound this plugin spawns carries both baselines.
+        crate::baseline::register_types(app);
+
         // Insert resources
         app.insert_resource(self.default_randomization.clone());
 
@@ -323,10 +328,11 @@ pub mod audio_systems {
 /// Prelude module for convenient imports.
 pub mod prelude {
     pub use crate::MsgSeedlingPlugin;
+    pub use crate::baseline::{BasePitch, BaseVolume};
     pub use crate::bevy_audio_guard::BevyAudioGuardPlugin;
     pub use crate::damping::{
-        BasePitch, DampingPlugin, DampingTargets, SelfDrivenVolume, SoundDamping,
-        SoundDampingField, UndampedSound,
+        DampingPlugin, DampingTargets, SelfDrivenVolume, SoundDamping, SoundDampingField,
+        UndampedSound,
     };
     #[cfg(not(target_arch = "wasm32"))]
     pub use crate::device_follow::FollowDefaultAudioDevice;
