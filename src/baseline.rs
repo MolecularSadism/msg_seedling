@@ -38,7 +38,11 @@ use bevy::prelude::*;
 /// `NaN`.
 #[must_use]
 pub(crate) fn sanitize_weight(value: f32) -> f32 {
-    if value.is_finite() { value.max(0.0) } else { 0.0 }
+    if value.is_finite() {
+        value.max(0.0)
+    } else {
+        0.0
+    }
 }
 
 /// The per-sound share of a sound's volume: its

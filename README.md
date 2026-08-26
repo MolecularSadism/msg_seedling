@@ -262,16 +262,20 @@ source drifting out fades back to normal instead of popping.
 ```rust
 app.add_plugins(DampingPlugin::<Sound>::default());
 
-commands.spawn((
-    Transform::from_xyz(40.0, -8.0, 0.0),
-    SoundDampingField {
-        radius: 12.0,
-        volume: 0.35,
-        cutoff_hz: 700.0,
-        speed: 0.9,
-        targets: DampingTargets::Both,
-    },
-));
+fn flood_the_basement(mut commands: Commands) {
+    // Everything within 12 units of the pool sounds like it is under it:
+    // most of the level gone, the highs gone first, the pitch dragged down.
+    commands.spawn((
+        Transform::from_xyz(40.0, -8.0, 0.0),
+        SoundDampingField {
+            radius: 12.0,
+            volume: 0.35,
+            cutoff_hz: 700.0,
+            speed: 0.9,
+            targets: DampingTargets::Both,
+        },
+    ));
+}
 ```
 
 A field is a *medium*, not a property of the things inside it, so what matters
@@ -326,11 +330,21 @@ Which sounds duck and which spawns trigger the duck are your policy:
 
 ```rust
 // Routine world sounds carry the marker, decided at spawn.
-commands.spawn((SamplePlayer::new(ambience).looping(), Sound::Ambience, Ducks));
+fn play_ambience(mut commands: Commands, server: Res<AssetServer>) {
+    commands.spawn((
+        SamplePlayer::new(server.load("wind.ogg")).looping(),
+        Sound::Ambience,
+        Ducks,
+    ));
+}
 
 // The cue itself does not -- and it steps the rest of the mix back.
-fn play_objective_cue(mut commands: Commands, mut duck: ResMut<DuckingEnvelope>) {
-    commands.spawn((SamplePlayer::new(cue), Sound::Sfx));
+fn play_objective_cue(
+    mut commands: Commands,
+    server: Res<AssetServer>,
+    mut duck: ResMut<DuckingEnvelope>,
+) {
+    commands.spawn((SamplePlayer::new(server.load("objective.ogg")), Sound::Sfx));
     duck.trigger();
 }
 ```
@@ -349,9 +363,14 @@ takes the main bus down instead, above every category:
 ```rust
 app.add_plugins(MixFadePlugin::<AudioSettings>::default());
 
-commands.trigger(FadeMix::out(Duration::from_millis(800)));
+fn leave_the_level(mut commands: Commands) {
+    commands.trigger(FadeMix::out(Duration::from_millis(800)));
+}
+
 // ...later, from the same caller:
-commands.trigger(FadeMix::back(Duration::from_millis(800)));
+fn enter_the_next_level(mut commands: Commands) {
+    commands.trigger(FadeMix::back(Duration::from_millis(800)));
+}
 ```
 
 Ownership is the protocol: whoever engages a fade owns restoring it, so every
@@ -547,8 +566,11 @@ by the queue on promotion), so nothing has to reverse-engineer them later.
 They are ordinary public components, so a host can read or drive them:
 
 ```rust
-// Duck one specific loop by hand, without touching the mix-wide envelope.
-commands.entity(engine_loop).insert(BaseVolume(0.3));
+// Pull one specific loop down by hand, without touching the mix-wide
+// envelope -- and have it survive the next volume-slider change.
+fn quieten(mut commands: Commands, engine_loop: Entity) {
+    commands.entity(engine_loop).insert(BaseVolume(0.3));
+}
 
 // Wind an engine up: a damping field still bends this baseline, rather than
 // replacing it.

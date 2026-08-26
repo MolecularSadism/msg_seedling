@@ -1,7 +1,7 @@
 use bevy::prelude::*;
 
 use crate::messages::{FadeAudio, PlayAudio, SpatialPosition, StopAudio};
-use crate::randomization::{DefaultRandomization, Randomization, resolve_randomization};
+use crate::randomization::{DefaultRandomization, Randomization};
 use crate::traits::{AudioCategory, AudioConfig};
 
 // -- Test types --
@@ -114,65 +114,106 @@ fn category_volume_multiplier() {
 
 // -- Randomization tests --
 
-#[test]
-fn randomization_default_uses_plugin_defaults() {
-    let defaults = DefaultRandomization {
-        volume: Some(0.2),
-        speed: Some(0.3),
-    };
-    let (vol, spd) = resolve_randomization(Randomization::Default, &defaults);
-    assert_eq!(vol, Some(0.2));
-    assert_eq!(spd, Some(0.3));
-}
+/// Deviation resolution only exists in the `rand` build; without the feature
+/// no deviation is ever drawn, so a request's `Randomization` is carried and
+/// ignored.
+#[cfg(feature = "rand")]
+mod randomization_resolution {
+    use super::*;
+    use crate::randomization::{deviate, resolve_randomization};
+    use rand::SeedableRng;
 
-#[test]
-fn randomization_volume_overrides_volume_keeps_speed_default() {
-    let defaults = DefaultRandomization {
-        volume: Some(0.2),
-        speed: Some(0.3),
-    };
-    let (vol, spd) = resolve_randomization(Randomization::Volume(0.5), &defaults);
-    assert_eq!(vol, Some(0.5));
-    assert_eq!(spd, Some(0.3));
-}
+    #[test]
+    fn randomization_default_uses_plugin_defaults() {
+        let defaults = DefaultRandomization {
+            volume: Some(0.2),
+            speed: Some(0.3),
+        };
+        let (vol, spd) = resolve_randomization(Randomization::Default, &defaults);
+        assert_eq!(vol, Some(0.2));
+        assert_eq!(spd, Some(0.3));
+    }
 
-#[test]
-fn randomization_speed_overrides_speed_keeps_volume_default() {
-    let defaults = DefaultRandomization {
-        volume: Some(0.2),
-        speed: Some(0.3),
-    };
-    let (vol, spd) = resolve_randomization(Randomization::Speed(0.1), &defaults);
-    assert_eq!(vol, Some(0.2));
-    assert_eq!(spd, Some(0.1));
-}
+    #[test]
+    fn randomization_volume_overrides_volume_keeps_speed_default() {
+        let defaults = DefaultRandomization {
+            volume: Some(0.2),
+            speed: Some(0.3),
+        };
+        let (vol, spd) = resolve_randomization(Randomization::Volume(0.5), &defaults);
+        assert_eq!(vol, Some(0.5));
+        assert_eq!(spd, Some(0.3));
+    }
 
-#[test]
-fn randomization_volume_and_speed_overrides_both() {
-    let defaults = DefaultRandomization {
-        volume: Some(0.2),
-        speed: Some(0.3),
-    };
-    let (vol, spd) = resolve_randomization(
-        Randomization::VolumeAndSpeed {
-            volume: 0.4,
-            speed: 0.6,
-        },
-        &defaults,
-    );
-    assert_eq!(vol, Some(0.4));
-    assert_eq!(spd, Some(0.6));
-}
+    #[test]
+    fn randomization_speed_overrides_speed_keeps_volume_default() {
+        let defaults = DefaultRandomization {
+            volume: Some(0.2),
+            speed: Some(0.3),
+        };
+        let (vol, spd) = resolve_randomization(Randomization::Speed(0.1), &defaults);
+        assert_eq!(vol, Some(0.2));
+        assert_eq!(spd, Some(0.1));
+    }
 
-#[test]
-fn randomization_with_none_defaults() {
-    let defaults = DefaultRandomization {
-        volume: None,
-        speed: None,
-    };
-    let (vol, spd) = resolve_randomization(Randomization::Default, &defaults);
-    assert_eq!(vol, None);
-    assert_eq!(spd, None);
+    #[test]
+    fn randomization_volume_and_speed_overrides_both() {
+        let defaults = DefaultRandomization {
+            volume: Some(0.2),
+            speed: Some(0.3),
+        };
+        let (vol, spd) = resolve_randomization(
+            Randomization::VolumeAndSpeed {
+                volume: 0.4,
+                speed: 0.6,
+            },
+            &defaults,
+        );
+        assert_eq!(vol, Some(0.4));
+        assert_eq!(spd, Some(0.6));
+    }
+
+    #[test]
+    fn randomization_with_none_defaults() {
+        let defaults = DefaultRandomization {
+            volume: None,
+            speed: None,
+        };
+        let (vol, spd) = resolve_randomization(Randomization::Default, &defaults);
+        assert_eq!(vol, None);
+        assert_eq!(spd, None);
+    }
+
+    #[test]
+    fn deviate_returns_the_centre_without_a_deviation() {
+        let mut rng = rand::rngs::SmallRng::seed_from_u64(7);
+        assert_eq!(deviate(&mut rng, 0.6, None), 0.6);
+        assert_eq!(deviate(&mut rng, 0.6, Some(0.0)), 0.6);
+        assert_eq!(deviate(&mut rng, 0.6, Some(f32::NAN)), 0.6);
+    }
+
+    #[test]
+    fn deviate_stays_inside_its_band_and_never_goes_negative() {
+        let mut rng = rand::rngs::SmallRng::seed_from_u64(11);
+        for _ in 0..64 {
+            let drawn = deviate(&mut rng, 0.5, Some(0.2));
+            assert!(
+                (0.4..=0.6).contains(&drawn),
+                "a ±20% draw around 0.5 escaped its band: {drawn}"
+            );
+        }
+        // A deviation wider than 1.0 floors at zero rather than flipping sign.
+        for _ in 0..64 {
+            let drawn = deviate(&mut rng, 0.5, Some(3.0));
+            assert!((0.0..=2.0).contains(&drawn), "wide draw escaped: {drawn}");
+        }
+    }
+
+    #[test]
+    fn deviate_around_zero_has_nothing_to_draw() {
+        let mut rng = rand::rngs::SmallRng::seed_from_u64(13);
+        assert_eq!(deviate(&mut rng, 0.0, Some(0.5)), 0.0);
+    }
 }
 
 #[test]

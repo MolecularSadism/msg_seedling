@@ -6,7 +6,8 @@ use bevy_seedling::prelude::*;
 use crate::baseline::{BasePitch, BaseVolume};
 use crate::fade::FadeOutAudio;
 use crate::messages::{FadeAudio, PlayAudio, StopAudio};
-use crate::randomization::{DefaultRandomization, resolve_randomization};
+#[cfg(feature = "rand")]
+use crate::randomization::{DefaultRandomization, deviate, resolve_randomization};
 use crate::traits::AudioCategory;
 
 /// Spawns one sound for a [`PlayAudio`] request, with its per-sound
@@ -41,9 +42,9 @@ fn spawn_requested_sound<C: AudioCategory>(
             speed: pitch.0.into(),
             ..Default::default()
         },
-        sample_effects![VolumeNode::from_linear(base.resolve(
-            msg.category.volume(config)
-        ))],
+        sample_effects![VolumeNode::from_linear(
+            base.resolve(msg.category.volume(config))
+        )],
         Name::new(format!("{:?}", msg.category)),
     ));
 
@@ -52,10 +53,7 @@ fn spawn_requested_sound<C: AudioCategory>(
     if let Some(parent) = msg.parent {
         entity.insert((SpatialPool, ChildOf(parent), Transform::default()));
     } else if let Some(position) = msg.position {
-        entity.insert((
-            SpatialPool,
-            Transform::from_translation(position.as_vec3()),
-        ));
+        entity.insert((SpatialPool, Transform::from_translation(position.as_vec3())));
     } else {
         entity.insert(DefaultPool);
     }
@@ -81,12 +79,8 @@ pub fn handle_play_audio<C: AudioCategory>(
 ) {
     for msg in messages.read() {
         let (vol_rand, spd_rand) = resolve_randomization(msg.randomization, &defaults);
-        let base = BaseVolume::new(crate::randomization::deviate(
-            &mut rng.0,
-            msg.volume,
-            vol_rand,
-        ));
-        let pitch = BasePitch::new(crate::randomization::deviate(&mut rng.0, 1.0, spd_rand));
+        let base = BaseVolume::new(deviate(&mut rng.0, msg.volume, vol_rand));
+        let pitch = BasePitch::new(deviate(&mut rng.0, 1.0, spd_rand));
         spawn_requested_sound(&mut commands, msg, &config, base, pitch);
     }
 }

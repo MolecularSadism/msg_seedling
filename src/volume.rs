@@ -53,7 +53,10 @@ pub fn update_category_volumes<C: AudioCategory>(
     mut volume_nodes: Query<&mut VolumeNode>,
 ) {
     for (category, effects, base) in &samples {
-        let target_volume = base.copied().unwrap_or_default().resolve(category.volume(&config));
+        let target_volume = base
+            .copied()
+            .unwrap_or_default()
+            .resolve(category.volume(&config));
         if let Ok(mut vol_node) = volume_nodes.get_effect_mut(effects) {
             vol_node.volume = Volume::Linear(target_volume);
         }

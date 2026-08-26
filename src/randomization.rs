@@ -52,6 +52,11 @@ impl Default for DefaultRandomization {
 ///
 /// Returns `(volume_deviation, speed_deviation)` as `Option<f32>` each.
 /// `None` means no randomization for that axis.
+///
+/// Only the `rand` build has anything to do with the answer; without the
+/// feature no deviation is ever drawn, so a request's [`Randomization`] is
+/// carried and ignored.
+#[cfg(feature = "rand")]
 pub fn resolve_randomization(
     randomization: Randomization,
     defaults: &DefaultRandomization,

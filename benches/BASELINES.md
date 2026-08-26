@@ -29,11 +29,29 @@ Mean with 95% confidence interval.
 ## Reproducing
 
 ```sh
-cargo bench -- --save-baseline base   # capture
-cargo bench -- --baseline base        # compare against it
+cargo bench --bench hot_path -- --save-baseline base   # capture
+cargo bench --bench hot_path -- --baseline base        # compare against it
 ```
+
+`--bench hot_path` is required, not tidiness: a bare `cargo bench` hands
+criterion's flags to the lib test harness first, which rejects them with
+`error: Unrecognized option: 'baseline'`.
 
 These were taken in a shared virtualised container, so absolute figures carry
 more run-to-run noise than a dedicated machine. Comparisons made with
 `--baseline base` on the same host are meaningful; comparing these absolute
-numbers against a different machine is not.
+numbers against a different machine — or a different toolchain — is not.
+
+## Since
+
+**0.4.0** left every benchmarked function byte-identical: the per-sound
+baselines changed which components `apply_sound_damping` reads, not the
+influence, resolution, or envelope math these cover. Verified by benchmarking
+the preceding commit on the same host and comparing with `--baseline`; every
+case landed inside run-to-run noise, so the table above still stands as the
+reference point.
+
+The system around them did get cheaper, in a way these micro-benchmarks do not
+see: `apply_sound_damping` no longer takes `Commands`, no longer carries a
+sparse-set `DampedVolumeBase` term in its query, and no longer inserts or
+removes a component per sound as fields and ducks take hold and let go.
