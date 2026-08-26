@@ -1,6 +1,6 @@
 [package]
 name = "msg_seedling"
-version = "0.3.1"
+version = "0.4.0"
 edition = "2024"
 authors = ["ffmulks <63452434+ffmulks@users.noreply.github.com>"]
 description = "A seedling-powered audio management crate for Bevy games with category-based volume, spatial audio, and randomization"
@@ -26,7 +26,14 @@ bevy_seedling = { version = "0.7", default-features = false, features = [
 rand = { version = "0.9", features = ["small_rng"], optional = true }
 
 [dev-dependencies]
+criterion = { version = "0.5", default-features = false, features = [
+    "cargo_bench_support",
+] }
 msg_testing = { git = "https://github.com/MolecularSadism/msg_testing" }
+
+[[bench]]
+name = "hot_path"
+harness = false
 
 [lints.clippy]
 too_many_arguments = "allow"
