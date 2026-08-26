@@ -11,6 +11,37 @@
 //! Fades of music length run in decibel space (see [`fade_target`]): a
 //! linear-amplitude ramp sags audibly down its middle and then hangs
 //! inaudibly on its tail, while a dB ramp is heard as an even slide.
+//!
+//! ## Example
+//!
+//! ```
+//! # use std::time::Duration;
+//! # use bevy::prelude::*;
+//! # use msg_seedling::prelude::*;
+//! # #[derive(Resource, Clone, Default)]
+//! # struct GameAudioConfig;
+//! # impl AudioConfig for GameAudioConfig {
+//! #     fn master_volume(&self) -> f32 { 1.0 }
+//! # }
+//! # let mut app = App::new();
+//! # app.add_plugins(MinimalPlugins);
+//! // Generic over the config, not the category: the bus sits above both.
+//! app.add_plugins(MixFadePlugin::<GameAudioConfig>::default());
+//!
+//! fn leave_the_level(mut commands: Commands) {
+//!     // The scene is about to despawn its own sound sources, so there is no
+//!     // per-sound list to fade — take the whole mix down instead.
+//!     commands.trigger(FadeMix::out(Duration::from_millis(800)));
+//! }
+//!
+//! /// Whoever faded out owns fading back: the mix stays silent, and the
+//! /// config-driven master write stands down, until this fires.
+//! fn enter_the_next_level(mut commands: Commands) {
+//!     commands.trigger(FadeMix::back(Duration::from_millis(800)));
+//! }
+//! # app.add_systems(Update, (leave_the_level, enter_the_next_level).chain());
+//! # app.update();
+//! ```
 
 use std::time::Duration;
 
@@ -32,8 +63,8 @@ const DB_SPACE_FADE_MIN_SECS: f32 = 0.5;
 const DB_FADE_SILENCE_DB: f32 = -60.0;
 
 /// The `fade_to` target for a fade of `duration` toward `linear` gain:
-/// linear for short fades, `Volume::Decibels` for music-length ones (see
-/// [`DB_SPACE_FADE_MIN_SECS`]).
+/// linear for short fades, `Volume::Decibels` for music-length ones (half a
+/// second or longer).
 ///
 /// In decibel space a `linear` of `0.0` becomes the −60 dB floor rather
 /// than true silence — −∞ dB has no finite ramp to it, and `bevy_seedling`
@@ -50,7 +81,7 @@ pub fn fade_target(linear: f32, duration: Duration) -> Volume {
 }
 
 /// Where a [`FadeMix`] points the main bus.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Reflect, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MixLevel {
     /// Silence — or as close as the fade gets: a music-length fade runs in
     /// decibel space and bottoms out at the −60 dB interpolation floor
@@ -70,7 +101,8 @@ pub enum MixLevel {
 /// down until [`FadeMix::back`] re-engages the config's level. A host
 /// driving the main bus itself can read this to respect an engaged fade the
 /// same way.
-#[derive(Resource, Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Resource, Reflect, Debug, Clone, Copy, PartialEq, Eq)]
+#[reflect(Resource)]
 pub struct MixFadeState {
     /// Where the last [`FadeMix`] pointed the bus; [`MixLevel::Full`] before
     /// any fade fires.
@@ -88,7 +120,7 @@ impl Default for MixFadeState {
 /// Fades the whole mix to [`MixLevel`] over `duration`.
 ///
 /// Trigger it as an event; [`MixFadePlugin`] installs the observer.
-#[derive(Event, Debug, Clone, Copy)]
+#[derive(Event, Reflect, Debug, Clone, Copy)]
 pub struct FadeMix {
     /// Where the bus is headed.
     pub to: MixLevel,
@@ -156,6 +188,9 @@ impl<Conf: AudioConfig> Default for MixFadePlugin<Conf> {
 
 impl<Conf: AudioConfig> Plugin for MixFadePlugin<Conf> {
     fn build(&self, app: &mut App) {
+        app.register_type::<MixLevel>();
+        app.register_type::<MixFadeState>();
+        app.register_type::<FadeMix>();
         app.init_resource::<Conf>();
         app.init_resource::<MixFadeState>();
         app.add_observer(on_fade_mix::<Conf>);

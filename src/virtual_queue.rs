@@ -127,6 +127,7 @@ use bevy_seedling::prelude::*;
 use bevy_seedling::prelude::PlaybackSettings;
 use bevy_seedling::sample::{AudioSample, QueuedSample};
 
+use crate::baseline::{BasePitch, BaseVolume, sanitize_weight};
 use crate::fade::{FadeInAudio, FadeOutAudio, FadeSystems};
 use crate::messages::SpatialPosition;
 use crate::traits::AudioCategory;
@@ -321,6 +322,10 @@ pub struct PlayQueuedAudio<C: AudioCategory> {
     /// culled. Requests without a [`PlayQueuedAudio::position`], and apps
     /// without a listener, are never culled. `None` (the default) never
     /// culls. [`Self::with_max_distance`] sanitizes the value.
+    ///
+    /// Measured in the XY plane against `SpatialListener2D` only, matching
+    /// [`damping`](crate::damping#geometry) — a `SpatialListener3D` app has no
+    /// listener to measure against here, so nothing is ever culled.
     pub max_distance: Option<f32>,
 }
 
@@ -401,9 +406,9 @@ impl<C: AudioCategory> PlayQueuedAudio<C> {
     }
 
     /// Culls the request when its position is farther than this from the
-    /// nearest spatial listener. Sanitized like the crate's other numeric
-    /// inputs: a non-finite distance is discarded (never culls), a negative
-    /// one clamps to `0.0`.
+    /// nearest `SpatialListener2D`, measured in the XY plane. Sanitized like
+    /// the crate's other numeric inputs: a non-finite distance is discarded
+    /// (never culls), a negative one clamps to `0.0`.
     #[must_use]
     pub fn with_max_distance(mut self, max_distance: f32) -> Self {
         self.max_distance = max_distance.is_finite().then_some(max_distance.max(0.0));
@@ -501,6 +506,7 @@ impl<C: AudioCategory> Plugin for VirtualVoiceQueuePlugin<C> {
         app.register_type::<VirtualSound<C>>();
         app.register_type::<Audible>();
         app.register_type::<Retiring>();
+        crate::baseline::register_types(app);
         app.init_resource::<C::Config>();
         app.init_resource::<AdmissionState<C>>();
         app.insert_resource(self.budget.clone());
@@ -657,16 +663,6 @@ fn enqueue_queued_audio<C: AudioCategory>(
     }
 }
 
-/// Non-finite → `0.0`, otherwise clamped to `>= 0.0`, keeping significance
-/// math and ranking total-order safe.
-fn sanitize_weight(value: f32) -> f32 {
-    if value.is_finite() {
-        value.max(0.0)
-    } else {
-        0.0
-    }
-}
-
 /// One queue entry's ranking inputs, for [`rank_by_significance`].
 #[derive(Clone, Copy, Debug)]
 pub struct SignificanceEntry {
@@ -819,8 +815,10 @@ fn rank_virtual_voices<C: AudioCategory>(
 /// elevated value on every promotion, overwriting the `SamplePriority(0)` a
 /// demotion drops the entry to, so a re-promoted loop defends its voice
 /// again. The bare `C` component rides along so per-sound category systems
-/// (damping, ducking, the config-driven volume rewrites) see the voice;
-/// [`release_voice`] strips it with the rest of the promotion.
+/// (damping, ducking, the config-driven volume rewrites) see the voice, and
+/// [`BaseVolume`]/[`BasePitch`] ride along with it so those systems recompute
+/// the entry's *own* level rather than flattening it to the bare category
+/// volume; [`release_voice`] strips all three with the rest of the promotion.
 fn promote<C: AudioCategory>(
     commands: &mut Commands,
     entity: Entity,
@@ -837,6 +835,8 @@ fn promote<C: AudioCategory>(
     ec.insert((
         player,
         sound.category,
+        BaseVolume(sound.base_volume),
+        BasePitch::default(),
         // `OnComplete::Remove` keeps the entity when seedling ends the voice
         // (steal, queue expiry, one-shot completion) so `reclaim_lost_voices`
         // can apply the queue's own policy.
@@ -911,8 +911,10 @@ fn reclaim_lost_voices<C: AudioCategory>(
     }
 }
 
-/// Strips everything a promotion added — the bare `C` component included —
-/// leaving a bare [`VirtualSound`] entry eligible for re-promotion.
+/// Strips everything a promotion added — the bare `C` component and the
+/// per-sound baselines included — leaving a bare [`VirtualSound`] entry
+/// eligible for re-promotion. The entry's authored volume survives in
+/// [`VirtualSound::base_volume`], so the next promotion restores it.
 fn release_voice<C: AudioCategory>(commands: &mut Commands, entity: Entity, has_sampler: bool) {
     // A live sampler needs seedling's completion observer (when
     // `SeedlingPlugin` is present) to release it and strip its private
@@ -932,6 +934,8 @@ fn release_voice<C: AudioCategory>(commands: &mut Commands, entity: Entity, has_
         .remove_with_requires::<SamplePlayer>()
         .remove::<(
             C,
+            BaseVolume,
+            BasePitch,
             Sampler,
             QueuedSample,
             AudioEvents,
@@ -1899,6 +1903,87 @@ mod tests {
         );
         app.update_n(1);
         assert_eq!(recorded_admissions(&app), 1);
+    }
+
+    #[test]
+    fn a_config_change_keeps_a_promoted_entry_s_own_volume() {
+        let mut app = queue_app(VirtualVoiceBudget::new(1));
+        app.add_plugins(crate::MsgSeedlingPlugin::<TestSound>::default());
+        app.world_mut().write_message(
+            PlayQueuedAudio::new(handle(1), TestSound::Sfx)
+                .looping()
+                .with_volume(0.25),
+        );
+        app.update_n(1);
+
+        let world = app.world_mut();
+        let voice = world
+            .query_filtered::<Entity, With<Audible>>()
+            .single(world)
+            .expect("promoted voice");
+        assert_eq!(
+            app.world().get::<BaseVolume>(voice).copied(),
+            Some(BaseVolume(0.25)),
+            "promotion records the entry's own level"
+        );
+
+        // Stand in for the promotion fade completing (see the ducking test).
+        app.world_mut().entity_mut(voice).remove::<FadeInAudio>();
+        let effect = app.world().get::<SampleEffects>(voice).expect("effects")[0];
+
+        // `MsgSeedlingPlugin` now reaches this voice through its bare `C`.
+        app.world_mut().resource_mut::<TestConfig>().sfx = 0.8;
+        app.update_n(1);
+
+        let volume = app
+            .world()
+            .get::<VolumeNode>(effect)
+            .expect("volume node")
+            .volume
+            .linear();
+        assert!(
+            (volume - 0.2).abs() < 1e-6,
+            "a settings change scales the entry's `with_volume`, it does not \
+             flatten every promoted voice to the category level, got {volume}"
+        );
+    }
+
+    #[test]
+    fn a_released_voice_sheds_its_baselines() {
+        let mut app = queue_app(VirtualVoiceBudget::new(1));
+        app.world_mut().write_message(
+            PlayQueuedAudio::new(handle(1), TestSound::Sfx)
+                .looping()
+                .with_volume(0.25),
+        );
+        app.update_n(1);
+        let world = app.world_mut();
+        let voice = world
+            .query_filtered::<Entity, With<Audible>>()
+            .single(world)
+            .expect("promoted voice");
+
+        // Flushed without another update: a further frame would simply
+        // re-promote the entry (it is still the only one, and the budget has
+        // room), putting the baselines straight back.
+        {
+            let world = app.world_mut();
+            release_voice::<TestSound>(&mut world.commands(), voice, false);
+            world.flush();
+        }
+
+        assert!(app.world().get::<BaseVolume>(voice).is_none());
+        assert!(app.world().get::<BasePitch>(voice).is_none());
+        assert!(
+            (app.world()
+                .get::<VirtualSound<TestSound>>(voice)
+                .expect("entry survives")
+                .base_volume
+                - 0.25)
+                .abs()
+                < 1e-6,
+            "the entry's authored volume survives for the next promotion"
+        );
     }
 
     #[test]

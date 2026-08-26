@@ -3,12 +3,72 @@ use core::time::Duration;
 use bevy::prelude::*;
 use bevy_seedling::prelude::*;
 
+use crate::baseline::{BasePitch, BaseVolume};
 use crate::fade::FadeOutAudio;
 use crate::messages::{FadeAudio, PlayAudio, StopAudio};
-use crate::randomization::{DefaultRandomization, resolve_randomization};
+#[cfg(feature = "rand")]
+use crate::randomization::{DefaultRandomization, deviate, resolve_randomization};
 use crate::traits::AudioCategory;
 
+/// Spawns one sound for a [`PlayAudio`] request, with its per-sound
+/// baselines already resolved.
+///
+/// The two baselines are the whole point of routing every spawn through here:
+/// the volume node is seeded with `category volume × base`, but the `base`
+/// itself is recorded on the entity so [`update_category_volumes`] and
+/// [`apply_sound_damping`] can re-derive that product later instead of
+/// overwriting it. See [`baseline`](crate::baseline).
+///
+/// [`update_category_volumes`]: crate::audio_systems::update_category_volumes
+/// [`apply_sound_damping`]: crate::damping::apply_sound_damping
+fn spawn_requested_sound<C: AudioCategory>(
+    commands: &mut Commands,
+    msg: &PlayAudio<C>,
+    config: &C::Config,
+    base: BaseVolume,
+    pitch: BasePitch,
+) {
+    let mut player = SamplePlayer::new(msg.handle.clone());
+    if msg.looping {
+        player = player.looping();
+    }
+
+    let mut entity = commands.spawn((
+        player,
+        msg.category,
+        base,
+        pitch,
+        PlaybackSettings {
+            speed: pitch.0.into(),
+            ..Default::default()
+        },
+        sample_effects![VolumeNode::from_linear(
+            base.resolve(msg.category.volume(config))
+        )],
+        Name::new(format!("{:?}", msg.category)),
+    ));
+
+    // A request with a parent or a position is an event somewhere in the
+    // world and is spatialized; everything else plays flat.
+    if let Some(parent) = msg.parent {
+        entity.insert((SpatialPool, ChildOf(parent), Transform::default()));
+    } else if let Some(position) = msg.position {
+        entity.insert((SpatialPool, Transform::from_translation(position.as_vec3())));
+    } else {
+        entity.insert(DefaultPool);
+    }
+}
+
 /// System that handles [`PlayAudio`] messages by spawning seedling `SamplePlayer` entities.
+///
+/// Both randomization axes are drawn here, from one system-local RNG, and
+/// baked into the entity's [`BaseVolume`]/[`BasePitch`] rather than into the
+/// volume node and playback speed alone. Drawing the speed here rather than
+/// deferring to seedling's `RandomPitch` (which applies in `Last`, a frame
+/// later) is what makes the pitch baseline knowable at spawn — a
+/// [`SoundDampingField`](crate::SoundDampingField) bends a randomized
+/// footstep down from *its* pitch, and could not if the baseline arrived
+/// after the first damped frame.
 #[cfg(feature = "rand")]
 pub fn handle_play_audio<C: AudioCategory>(
     mut commands: Commands,
@@ -17,68 +77,19 @@ pub fn handle_play_audio<C: AudioCategory>(
     config: Res<C::Config>,
     mut messages: MessageReader<PlayAudio<C>>,
 ) {
-    use rand::Rng;
-
     for msg in messages.read() {
         let (vol_rand, spd_rand) = resolve_randomization(msg.randomization, &defaults);
-
-        // Compute category volume
-        let category_volume = msg.category.volume(&config) * msg.volume;
-
-        // Resolve volume with optional randomization
-        let final_volume = match vol_rand {
-            Some(dev) if dev > 0.0 => {
-                let min = category_volume * (1.0 - dev);
-                let max = category_volume * (1.0 + dev);
-                rng.0.random_range(min..=max)
-            }
-            _ => category_volume,
-        };
-
-        // Build sample player
-        let mut player = SamplePlayer::new(msg.handle.clone());
-        if msg.looping {
-            player = player.looping();
-        }
-
-        let is_spatial = msg.parent.is_some() || msg.position.is_some();
-
-        // Spawn entity with appropriate pool
-        let mut entity = if is_spatial {
-            commands.spawn((
-                player,
-                SpatialPool,
-                msg.category,
-                sample_effects![VolumeNode::from_linear(final_volume)],
-                Name::new(format!("{:?}", msg.category)),
-            ))
-        } else {
-            commands.spawn((
-                player,
-                DefaultPool,
-                msg.category,
-                sample_effects![VolumeNode::from_linear(final_volume)],
-                Name::new(format!("{:?}", msg.category)),
-            ))
-        };
-
-        // Speed randomization via seedling's RandomPitch
-        if let Some(dev) = spd_rand
-            && dev > 0.0
-        {
-            entity.insert(RandomPitch::new(dev as f64));
-        }
-
-        // Spatial positioning
-        if let Some(parent) = msg.parent {
-            entity.insert((ChildOf(parent), Transform::default()));
-        } else if let Some(position) = msg.position {
-            entity.insert(Transform::from_translation(position.as_vec3()));
-        }
+        let base = BaseVolume::new(deviate(&mut rng.0, msg.volume, vol_rand));
+        let pitch = BasePitch::new(deviate(&mut rng.0, 1.0, spd_rand));
+        spawn_requested_sound(&mut commands, msg, &config, base, pitch);
     }
 }
 
 /// System that handles [`PlayAudio`] messages without randomization (no `rand` feature).
+///
+/// Every sound still carries its [`BaseVolume`]/[`BasePitch`]; only the
+/// deviation is missing, so the baselines are the request's own volume and an
+/// unbent pitch.
 #[cfg(not(feature = "rand"))]
 pub fn handle_play_audio<C: AudioCategory>(
     mut commands: Commands,
@@ -86,38 +97,8 @@ pub fn handle_play_audio<C: AudioCategory>(
     mut messages: MessageReader<PlayAudio<C>>,
 ) {
     for msg in messages.read() {
-        let category_volume = msg.category.volume(&config) * msg.volume;
-
-        let mut player = SamplePlayer::new(msg.handle.clone());
-        if msg.looping {
-            player = player.looping();
-        }
-
-        let is_spatial = msg.parent.is_some() || msg.position.is_some();
-
-        let mut entity = if is_spatial {
-            commands.spawn((
-                player,
-                SpatialPool,
-                msg.category,
-                sample_effects![VolumeNode::from_linear(category_volume)],
-                Name::new(format!("{:?}", msg.category)),
-            ))
-        } else {
-            commands.spawn((
-                player,
-                DefaultPool,
-                msg.category,
-                sample_effects![VolumeNode::from_linear(category_volume)],
-                Name::new(format!("{:?}", msg.category)),
-            ))
-        };
-
-        if let Some(parent) = msg.parent {
-            entity.insert((ChildOf(parent), Transform::default()));
-        } else if let Some(position) = msg.position {
-            entity.insert(Transform::from_translation(position.as_vec3()));
-        }
+        let base = BaseVolume::new(msg.volume);
+        spawn_requested_sound(&mut commands, msg, &config, base, BasePitch::default());
     }
 }
 

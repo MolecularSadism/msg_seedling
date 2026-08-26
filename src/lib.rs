@@ -6,6 +6,29 @@
 //! providing category-based volume control, spatial audio, and playback
 //! randomization through a simple message-based API.
 //!
+//! ## What is here
+//!
+//! [`MsgSeedlingPlugin`] is the core: messages to play, stop and fade audio by
+//! category, and config-driven volume. Everything else is opt-in and composes
+//! with it.
+//!
+//! | Module | Plugin | What it adds |
+//! |--------|--------|--------------|
+//! | [`damping`] | [`DampingPlugin<C>`](damping::DampingPlugin) | world-space fields that muffle the sound crossing them, on volume, cutoff and pitch |
+//! | [`ducking`] | shared with [`damping`], or [`ducking::plugin`] | one mix-wide sidechain envelope so a crucial cue lands |
+//! | [`virtual_queue`] | [`VirtualVoiceQueuePlugin<C>`](virtual_queue::VirtualVoiceQueuePlugin) | a significance-ranked voice budget that crossfades instead of hard-cutting |
+//! | [`mix_fade`] | [`MixFadePlugin<Conf>`](mix_fade::MixFadePlugin) | fading the whole main bus at once |
+//! | [`fade`] | [`fade::plugin`] | `FadeInAudio`/`FadeOutAudio` for any sample entity |
+//! | [`device_follow`] | [`device_follow::plugin`] | keeps the stream on the OS default output device (native only) |
+//!
+//! ## The volume model
+//!
+//! A sound's gain is a *product of independently-owned layers* — `category
+//! volume × `[`BaseVolume`]` × damping × duck` — and every system that writes a
+//! sound's volume node recomputes that whole product rather than overwriting
+//! it. [`baseline`] is where the per-sound halves of it live, and why the
+//! layers compose instead of racing.
+//!
 //! ## Quick Start
 //!
 //! 1. Define your audio categories:
@@ -140,6 +163,7 @@
 //! types explicitly wherever `bevy::prelude` would export the same name — and
 //! [`BevyAudioGuardPlugin`] warns at startup when `AudioPlugin` is live anyway.
 
+pub mod baseline;
 pub mod bevy_audio_guard;
 pub mod damping;
 #[cfg(not(target_arch = "wasm32"))]
@@ -156,10 +180,11 @@ mod traits;
 pub mod virtual_queue;
 mod volume;
 
+pub use baseline::{BasePitch, BaseVolume};
 pub use bevy_audio_guard::BevyAudioGuardPlugin;
 pub use damping::{
-    ActiveField, BasePitch, DampingPlugin, DampingTargets, OPEN_CUTOFF_HZ, SelfDrivenVolume,
-    SoundDamping, SoundDampingField, UndampedSound, apply_sound_damping, nearest_listener,
+    ActiveField, DampingPlugin, DampingTargets, OPEN_CUTOFF_HZ, SelfDrivenVolume, SoundDamping,
+    SoundDampingField, UndampedSound, apply_sound_damping, nearest_listener,
 };
 #[cfg(not(target_arch = "wasm32"))]
 pub use device_follow::FollowDefaultAudioDevice;
@@ -285,6 +310,9 @@ impl<C: AudioCategory> Plugin for MsgSeedlingPlugin<C> {
         // registration is idempotent across category types.
         crate::fade::plugin(app);
 
+        // Every sound this plugin spawns carries both baselines.
+        crate::baseline::register_types(app);
+
         // Insert resources
         app.insert_resource(self.default_randomization.clone());
 
@@ -323,10 +351,11 @@ pub mod audio_systems {
 /// Prelude module for convenient imports.
 pub mod prelude {
     pub use crate::MsgSeedlingPlugin;
+    pub use crate::baseline::{BasePitch, BaseVolume};
     pub use crate::bevy_audio_guard::BevyAudioGuardPlugin;
     pub use crate::damping::{
-        BasePitch, DampingPlugin, DampingTargets, SelfDrivenVolume, SoundDamping,
-        SoundDampingField, UndampedSound,
+        DampingPlugin, DampingTargets, SelfDrivenVolume, SoundDamping, SoundDampingField,
+        UndampedSound,
     };
     #[cfg(not(target_arch = "wasm32"))]
     pub use crate::device_follow::FollowDefaultAudioDevice;
