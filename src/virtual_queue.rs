@@ -322,6 +322,10 @@ pub struct PlayQueuedAudio<C: AudioCategory> {
     /// culled. Requests without a [`PlayQueuedAudio::position`], and apps
     /// without a listener, are never culled. `None` (the default) never
     /// culls. [`Self::with_max_distance`] sanitizes the value.
+    ///
+    /// Measured in the XY plane against `SpatialListener2D` only, matching
+    /// [`damping`](crate::damping#geometry) — a `SpatialListener3D` app has no
+    /// listener to measure against here, so nothing is ever culled.
     pub max_distance: Option<f32>,
 }
 
@@ -402,9 +406,9 @@ impl<C: AudioCategory> PlayQueuedAudio<C> {
     }
 
     /// Culls the request when its position is farther than this from the
-    /// nearest spatial listener. Sanitized like the crate's other numeric
-    /// inputs: a non-finite distance is discarded (never culls), a negative
-    /// one clamps to `0.0`.
+    /// nearest `SpatialListener2D`, measured in the XY plane. Sanitized like
+    /// the crate's other numeric inputs: a non-finite distance is discarded
+    /// (never culls), a negative one clamps to `0.0`.
     #[must_use]
     pub fn with_max_distance(mut self, max_distance: f32) -> Self {
         self.max_distance = max_distance.is_finite().then_some(max_distance.max(0.0));

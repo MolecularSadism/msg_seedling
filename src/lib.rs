@@ -6,6 +6,29 @@
 //! providing category-based volume control, spatial audio, and playback
 //! randomization through a simple message-based API.
 //!
+//! ## What is here
+//!
+//! [`MsgSeedlingPlugin`] is the core: messages to play, stop and fade audio by
+//! category, and config-driven volume. Everything else is opt-in and composes
+//! with it.
+//!
+//! | Module | Plugin | What it adds |
+//! |--------|--------|--------------|
+//! | [`damping`] | [`DampingPlugin<C>`](damping::DampingPlugin) | world-space fields that muffle the sound crossing them, on volume, cutoff and pitch |
+//! | [`ducking`] | shared with [`damping`], or [`ducking::plugin`] | one mix-wide sidechain envelope so a crucial cue lands |
+//! | [`virtual_queue`] | [`VirtualVoiceQueuePlugin<C>`](virtual_queue::VirtualVoiceQueuePlugin) | a significance-ranked voice budget that crossfades instead of hard-cutting |
+//! | [`mix_fade`] | [`MixFadePlugin<Conf>`](mix_fade::MixFadePlugin) | fading the whole main bus at once |
+//! | [`fade`] | [`fade::plugin`] | `FadeInAudio`/`FadeOutAudio` for any sample entity |
+//! | [`device_follow`] | [`device_follow::plugin`] | keeps the stream on the OS default output device (native only) |
+//!
+//! ## The volume model
+//!
+//! A sound's gain is a *product of independently-owned layers* — `category
+//! volume × `[`BaseVolume`]` × damping × duck` — and every system that writes a
+//! sound's volume node recomputes that whole product rather than overwriting
+//! it. [`baseline`] is where the per-sound halves of it live, and why the
+//! layers compose instead of racing.
+//!
 //! ## Quick Start
 //!
 //! 1. Define your audio categories:

@@ -18,6 +18,49 @@
 //! priority are fixed by then, so the policy is a spawn-time decision), and
 //! call [`DuckingEnvelope::trigger`] from the host's own qualifying-spawn
 //! path.
+//!
+//! ## Example
+//!
+//! ```
+//! # use bevy::prelude::*;
+//! # use msg_seedling::prelude::*;
+//! # use bevy_seedling::prelude::*;
+//! # #[derive(Component, Clone, Copy, Default, Debug, PartialEq, Eq, Hash, Reflect)]
+//! # #[reflect(Component)]
+//! # enum Sound { #[default] Sfx }
+//! # #[derive(Resource, Clone, Default)]
+//! # struct GameAudioConfig;
+//! # impl AudioConfig for GameAudioConfig {
+//! #     fn master_volume(&self) -> f32 { 1.0 }
+//! # }
+//! # impl AudioCategory for Sound {
+//! #     type Config = GameAudioConfig;
+//! #     fn volume(&self, _config: &GameAudioConfig) -> f32 { 1.0 }
+//! # }
+//! # let mut app = App::new();
+//! # app.add_plugins(MinimalPlugins);
+//! // `DampingPlugin` pulls the envelope in and folds it into its volume
+//! // write; `ducking::plugin` alone is enough if you write your own.
+//! app.add_plugins(DampingPlugin::<Sound>::default());
+//!
+//! /// The routine bed: marked once, at spawn.
+//! fn play_ambience(mut commands: Commands) {
+//!     commands.spawn((
+//!         SamplePlayer::new(Handle::default()).looping(),
+//!         Sound::Sfx,
+//!         Ducks,
+//!     ));
+//! }
+//!
+//! /// The cue that has to land: it does not carry `Ducks` itself, and it
+//! /// steps the rest of the mix back on the frame it spawns.
+//! fn play_objective_cue(mut commands: Commands, mut duck: ResMut<DuckingEnvelope>) {
+//!     commands.spawn((SamplePlayer::new(Handle::default()), Sound::Sfx));
+//!     duck.trigger();
+//! }
+//! # app.add_systems(Update, (play_ambience, play_objective_cue));
+//! # app.update();
+//! ```
 
 use bevy::prelude::*;
 

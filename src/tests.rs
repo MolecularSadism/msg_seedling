@@ -362,10 +362,11 @@ mod spawned_baselines {
             .query::<(&BaseVolume, &BasePitch, &PlaybackSettings, &SampleEffects)>()
             .single(world)
             .expect("exactly one spawned sound");
-        let (base, pitch, speed, effects) = (*base, *pitch, settings.speed, effects.clone());
+        let (base, pitch, speed) = (*base, *pitch, settings.speed);
+        let effects: Vec<Entity> = effects.iter().collect();
         let node_volume = effects
             .iter()
-            .find_map(|effect| world.get::<VolumeNode>(effect))
+            .find_map(|effect| world.get::<VolumeNode>(*effect))
             .expect("volume node effect")
             .volume
             .linear();

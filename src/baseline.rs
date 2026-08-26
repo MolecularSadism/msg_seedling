@@ -64,8 +64,9 @@ impl BaseVolume {
     /// Silence that survives a config change.
     pub const SILENT: Self = Self(0.0);
 
-    /// Creates a baseline from an authored gain, sanitized by
-    /// [`sanitize_gain`].
+    /// Creates a baseline from an authored gain: non-finite becomes `0.0`,
+    /// negative clamps to `0.0`. A hostile volume silences a sound rather
+    /// than inverting its phase or poisoning a later multiply with `NaN`.
     #[must_use]
     pub fn new(volume: f32) -> Self {
         Self(sanitize_gain(volume))

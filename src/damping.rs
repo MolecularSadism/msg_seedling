@@ -38,7 +38,7 @@
 //! ## What is dampable
 //!
 //! Category-level exemptions go through
-//! [`AudioCategory::is_dampable`](crate::AudioCategory::is_dampable)
+//! [`AudioCategory::is_dampable`](crate::AudioCategory::is_dampable())
 //! (interface audio, typically); per-sound exemptions through the
 //! [`UndampedSound`] marker. A sound whose volume node another system owns
 //! outright carries [`SelfDrivenVolume`] and keeps its filter and pitch
@@ -54,9 +54,62 @@
 //! into a field is exactly the effect, and it would be meaningless for the
 //! music to muffle because something else fell in.
 //!
+//! ## Geometry
+//!
+//! Field membership is measured in the XY plane: centres, source positions
+//! and listener positions are all `GlobalTransform` translations with `z`
+//! dropped, and only `SpatialListener2D` counts as a listener. A 3D game gets
+//! nothing from the listener half of a field — a `SpatialListener3D` is not
+//! seen, so [`DampingTargets::Listeners`] and the listener term of
+//! [`DampingTargets::Both`] never fire — while the source half still works on
+//! the XY projection of its positions. Measuring in three dimensions instead
+//! is not a drop-in swap: a 2D game layers its sprites along `z`, and letting
+//! that distance attenuate would muffle sounds by their draw order.
+//!
 //! What stays with the host: pool construction (the effect chain and its
 //! distance model are authored per game), and any announcement layer (entry/
 //! exit cues, immersion beds) built on top of [`SoundDampingField::influence`].
+//!
+//! ## Example
+//!
+//! ```
+//! # use bevy::prelude::*;
+//! # use msg_seedling::prelude::*;
+//! # #[derive(Component, Clone, Copy, Default, Debug, PartialEq, Eq, Hash, Reflect)]
+//! # #[reflect(Component)]
+//! # enum Sound { #[default] Sfx, Ui }
+//! # #[derive(Resource, Clone, Default)]
+//! # struct GameAudioConfig;
+//! # impl AudioConfig for GameAudioConfig {
+//! #     fn master_volume(&self) -> f32 { 1.0 }
+//! # }
+//! # impl AudioCategory for Sound {
+//! #     type Config = GameAudioConfig;
+//! #     fn volume(&self, _config: &GameAudioConfig) -> f32 { 1.0 }
+//! #     fn is_dampable(&self) -> bool { !matches!(self, Sound::Ui) }
+//! # }
+//! # let mut app = App::new();
+//! # app.add_plugins(MinimalPlugins);
+//! app.add_plugins(DampingPlugin::<Sound>::default());
+//!
+//! fn flood_the_basement(mut commands: Commands) {
+//!     // Everything within 12 units of the pool sounds like it is under it:
+//!     // most of the level gone, the highs gone first, the pitch dragged
+//!     // down a little.
+//!     commands.spawn((
+//!         Transform::from_xyz(40.0, -8.0, 0.0),
+//!         SoundDampingField {
+//!             radius: 12.0,
+//!             volume: 0.35,
+//!             cutoff_hz: 700.0,
+//!             speed: 0.9,
+//!             targets: DampingTargets::Both,
+//!         },
+//!     ));
+//! }
+//! # app.add_systems(Update, flood_the_basement);
+//! # app.update();
+//! ```
 
 use bevy::prelude::*;
 use bevy_seedling::prelude::*;
@@ -340,7 +393,10 @@ fn geometric_lerp(from: f32, to: f32, t: f32) -> f32 {
 /// The listener whose ears a field centred at `centre` covers.
 ///
 /// `bevy_seedling` spatializes each emitter against its nearest listener, so
-/// a field measures itself against the same one.
+/// a field measures itself against the same one. Positions are in the XY
+/// plane (see the [module docs](self#geometry)); an empty slice — an app with
+/// no `SpatialListener2D` — has no listener to be inside anything, so every
+/// field falls back to its source term alone.
 #[must_use]
 pub fn nearest_listener(listeners: &[Vec2], centre: Vec2) -> Option<Vec2> {
     listeners.iter().copied().min_by(|a, b| {
@@ -512,6 +568,7 @@ impl<C: AudioCategory> Plugin for DampingPlugin<C> {
 
         app.register_type::<SoundDampingField>();
         app.register_type::<DampingTargets>();
+        app.register_type::<SoundDamping>();
         app.register_type::<UndampedSound>();
         app.register_type::<SelfDrivenVolume>();
         crate::baseline::register_types(app);

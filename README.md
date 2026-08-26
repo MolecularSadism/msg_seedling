@@ -8,8 +8,10 @@ Built on the [Firewheel](https://github.com/BillyDM/Firewheel) audio engine via 
 - **Message-based API** -- fire-and-forget `PlayAudio`, `StopAudio`, `FadeAudio` via Bevy messages
 - **Spatial audio** -- 2D/3D positioning with `Option<Vec2>` / `Option<Vec3>`, or parent entity attachment
 - **Randomization** -- configurable per-play volume and speed deviation with plugin-wide defaults
-- **Smooth fading** -- audio-thread `VolumeFade` for glitch-free fade-outs, plus reusable `FadeInAudio`/`FadeOutAudio` components for any sample entity
-- **Virtual voice queue** -- opt-in, significance-ranked voice budget that crossfades between sounds instead of hard-cutting when a pool runs out of room; displaced loops wait silently and come back
+- **Smooth fading** -- audio-thread ramps for glitch-free fade-outs, reusable `FadeInAudio`/`FadeOutAudio` components for any sample entity, and `FadeMix` for taking the whole bus down at once
+- **Sound damping fields** -- world-space volumes that muffle what crosses them, on volume, low-pass cutoff and pitch at once
+- **Sidechain ducking** -- one mix-wide envelope that steps the routine mix back so a crucial cue lands
+- **Virtual voice queue** -- opt-in, significance-ranked voice budget that crossfades between sounds instead of hard-cutting when a pool runs out of room; displaced loops wait silently and come back, and admission controls drop the requests not worth queueing
 
 ## Quick Start
 
@@ -20,7 +22,7 @@ the `2d`, `3d` and `ui` feature groups, and nothing here plays through it.
 
 ```toml
 [dependencies]
-msg_seedling = "0.3"
+msg_seedling = "0.4"
 bevy_seedling = "0.7"
 bevy = { version = "0.18", default-features = false, features = [
     "2d_bevy_render", "default_app", "picking", "scene",
@@ -98,6 +100,18 @@ fn main() {
 }
 ```
 
+`MsgSeedlingPlugin<C>` is the only one you need. Everything else is opt-in and
+composes with it -- add what your game actually uses:
+
+| Plugin | Scoped to | Gives you |
+|--------|-----------|-----------|
+| `DampingPlugin::<C>` | one category type | [sound damping fields](#sound-damping-fields), and the [ducking envelope](#sidechain-ducking) they share a volume write with |
+| `VirtualVoiceQueuePlugin::<C>` | one category type | the [significance-ranked voice budget](#virtual-voice-queue) |
+| `MixFadePlugin::<Config>` | one config type | [`FadeMix`](#fading-the-whole-mix) over the main bus |
+| `msg_seedling::ducking::plugin` | the whole app | the ducking envelope alone, if you write your own volume nodes |
+| `msg_seedling::fade::plugin` | the whole app | `FadeInAudio`/`FadeOutAudio` alone (already pulled in by the two above) |
+| `msg_seedling::device_follow::plugin` | the whole app (native) | [following the OS default output device](#following-the-os-default-output-device) |
+
 ### 4. Play audio
 
 ```rust
@@ -168,7 +182,12 @@ MsgSeedlingPlugin::<Sound>::new()
     })
 ```
 
-Volume randomization uses a system-local `SmallRng`. Speed randomization delegates to seedling's built-in `RandomPitch`.
+Both axes are drawn at spawn from one system-local `SmallRng`, and the results
+are recorded on the entity as `BaseVolume` and `BasePitch` (see [Per-sound
+baselines](#per-sound-baselines)) rather than only baked into the volume node
+and playback speed. That is what lets a settings change, a damping field, or a
+duck scale a randomized sound from *its* level and *its* pitch instead of
+flattening every sound of the category onto the same one.
 
 ## Spatial Audio
 
@@ -180,6 +199,12 @@ You must add a `SpatialListener2D` (or `SpatialListener3D`) to your listener ent
 // On your camera or player
 commands.spawn((Camera2d::default(), SpatialListener2D));
 ```
+
+Two features look for a listener themselves rather than going through seedling,
+and both only recognize `SpatialListener2D`: the listener half of a [damping
+field](#sound-damping-fields), and the queue's `.with_max_distance()` culling.
+Both fail open in a 3D app -- nothing is damped by listener membership, nothing
+is culled -- rather than misbehaving.
 
 For 2D games, configure the spatial scale so pixel distances map to audio units:
 
@@ -218,6 +243,128 @@ commands.insert_resource(FollowDefaultAudioDevice {
     poll_interval: Duration::from_millis(500),
 });
 ```
+
+## Sound Damping Fields
+
+A `SoundDampingField` is a sphere of influence placed on any entity with a
+transform -- a body of water, a vent shaft, a wall of foliage. Sound crossing it
+is attenuated on three axes at once:
+
+- **volume**, a linear multiplier folded into the sound's volume node;
+- **cutoff**, the frequency of the sound's low-pass filter -- the part that
+  actually reads as "muffled", because dense matter swallows highs long before
+  lows;
+- **speed**, a pitch bend on top of the sound's own `BasePitch`.
+
+All three taper from full strength at the centre to nothing at the rim, so a
+source drifting out fades back to normal instead of popping.
+
+```rust
+app.add_plugins(DampingPlugin::<Sound>::default());
+
+commands.spawn((
+    Transform::from_xyz(40.0, -8.0, 0.0),
+    SoundDampingField {
+        radius: 12.0,
+        volume: 0.35,
+        cutoff_hz: 700.0,
+        speed: 0.9,
+        targets: DampingTargets::Both,
+    },
+));
+```
+
+A field is a *medium*, not a property of the things inside it, so what matters
+is whether sound crosses it -- which means two positions, the source's and the
+listener's. `DampingTargets` picks which of them a field reads, and the two are
+combined with a **maximum**, never a product:
+
+| source | listener | damping |
+|--------|----------|---------|
+| inside | outside  | full -- the sound has to get out |
+| outside| inside   | full -- the sound has to get in |
+| inside | inside   | full, **once** -- you are both in the soup |
+| outside| outside  | none |
+
+Overlapping fields do not stack either: on each axis the strongest one wins, so
+two mild fields cannot silence a sound neither of them authored.
+
+Exemptions come at two levels. `AudioCategory::is_dampable` exempts a whole
+category (interface audio is the classic case -- a menu click is not an event in
+the world, so a field in the world does not get to muffle it); the
+`UndampedSound` marker exempts one sound, which is what a field's own
+announcement bed needs. A sound whose volume node another system owns outright
+carries `SelfDrivenVolume` and keeps its filter and pitch damping while its
+volume is left alone.
+
+**The low-pass axis needs a filter to drive.** It reaches only sounds whose
+pool effect chain carries a `LowPassNode`, and `bevy_seedling` fixes that chain
+when the pool is created. Route dampable sounds through a pool of your own that
+includes one, parked at `OPEN_CUTOFF_HZ`; everything else is volume- and
+pitch-damped only.
+
+**Geometry is 2D.** Membership is measured in the XY plane, and only
+`SpatialListener2D` counts as a listener -- a `SpatialListener3D` app gets the
+source half of a field but never the listener half. Measuring in three
+dimensions is not a drop-in swap, since a 2D game layers its sprites along `z`
+and letting that distance attenuate would muffle sounds by draw order.
+
+## Sidechain Ducking
+
+Raising a crucial cue's own gain to make it land just feeds the saturation that
+buries it. A mix makes a cue land the other way around: everything routine
+steps back a few decibels the moment it starts, and returns once it has had its
+say.
+
+One `DuckingEnvelope` serves the whole mix -- a fast attack, a brief hold, a
+slow release, defaulting to a felt-but-safe -6 dB dip. It never touches a
+volume node itself; `DampingPlugin` folds it into the same per-frame volume
+write damping already owns, because two systems writing the same nodes on
+alternate frames would flicker.
+
+Which sounds duck and which spawns trigger the duck are your policy:
+
+```rust
+// Routine world sounds carry the marker, decided at spawn.
+commands.spawn((SamplePlayer::new(ambience).looping(), Sound::Ambience, Ducks));
+
+// The cue itself does not -- and it steps the rest of the mix back.
+fn play_objective_cue(mut commands: Commands, mut duck: ResMut<DuckingEnvelope>) {
+    commands.spawn((SamplePlayer::new(cue), Sound::Sfx));
+    duck.trigger();
+}
+```
+
+Trigger it when a qualifying sound *actually spawns* -- a request dropped by a
+voice budget should duck nothing. If you write your own volume nodes, read
+`DuckingEnvelope::gain_for(ducks)` and fold it in the same way; `ducking::plugin`
+registers the envelope without pulling in damping.
+
+## Fading the Whole Mix
+
+`FadeAudio` fades one category and `FadeOutAudio` fades one sound, but a scene
+about to despawn its own sound sources has no per-sound list to fade. `FadeMix`
+takes the main bus down instead, above every category:
+
+```rust
+app.add_plugins(MixFadePlugin::<AudioSettings>::default());
+
+commands.trigger(FadeMix::out(Duration::from_millis(800)));
+// ...later, from the same caller:
+commands.trigger(FadeMix::back(Duration::from_millis(800)));
+```
+
+Ownership is the protocol: whoever engages a fade owns restoring it, so every
+`out` is paired with a later `back`. While the mix is pointed at silence, the
+config-driven master-volume write stands down -- a volume-slider or mute change
+must not snap a faded-out bus back to full -- and the deferred level lands with
+the `back`, which reads the live config.
+
+Fades of half a second or longer run in decibel space, because a
+linear-amplitude ramp of music length sags audibly down its middle and then
+hangs inaudibly on its tail. One consequence is worth knowing: dB interpolation
+clamps at a -60 dB floor, so a music-length fade-out idles at linear ~0.001
+rather than a true zero. Inaudible on any real mix, but not literally silent.
 
 ## Virtual Voice Queue
 
@@ -290,14 +437,52 @@ fn leave_storm_area(mut stop: MessageWriter<StopQueuedAudio<Sound>>, wind: Res<W
 }
 ```
 
-This queue is independent of `PlayAudio`/`StopAudio`/`FadeAudio` and the
-per-category volume-update systems -- a promoted entry does not carry the
-bare `C` component those systems match on, so queued entries are stopped via
-`StopQueuedAudio` instead. `PlayQueuedAudio` carries no `Randomization`
-support. Budgets are scoped per category type `C`, so e.g. music and SFX
-never compete for the same slots. Significance does not currently factor in
-distance for spatial sounds -- bake any distance attenuation into
-`.with_volume()` or `.with_priority()` before sending.
+A promoted entry carries the bare `C` component for as long as it holds a real
+voice, so the crate's per-sound category systems reach queue voices like any
+other sound of the category: damping fields, the ducking envelope, and -- when
+`MsgSeedlingPlugin` is added for the same `C` -- `StopAudio`, `FadeAudio` and
+the config-driven volume rewrites too. Waiting (virtual) entries carry no `C`,
+and a demoted loop sheds it along with its voice, so prefer `StopQueuedAudio`
+for queue entries: it is the only stop that also reaches the waiting ones, and
+it fades audible ones out through the queue's own crossfade instead of cutting
+them.
+
+`PlayQueuedAudio` carries no `Randomization` support. Budgets are scoped per
+category type `C`, so e.g. music and SFX never compete for the same slots.
+Significance does not factor in distance for spatial sounds -- bake any
+distance attenuation into `.with_volume()` or `.with_priority()` before
+sending, or cull far requests outright with `.with_max_distance()`.
+
+### Admission controls
+
+Every `PlayQueuedAudio` is admitted by default. Four opt-in controls drop the
+requests not worth queueing at all, before they ever cost a ranking pass --
+each of them off unless set, so an existing queue behaves exactly as before:
+
+```rust
+// One global cap, on the budget: at most 64 requests enter the queue per
+// frame, across every sound. Excess requests are dropped, not deferred --
+// a one-shot delayed a frame would play out of sync with its cause.
+VirtualVoiceBudget::<Sound>::new(16).with_max_admissions_per_frame(64);
+
+writer.write(
+    PlayQueuedAudio::new(server.load("ricochet.ogg"), Sound::Sfx)
+        .at(impact_position)
+        // At most 4 live entries playing this same sample...
+        .with_max_concurrent(4)
+        // ...at most 2 of them admitted in any one frame...
+        .with_max_per_frame(2)
+        // ...no sooner than 40ms after the last one...
+        .with_min_repeat_interval(Duration::from_millis(40))
+        // ...and never when it happens off-screen.
+        .with_max_distance(1200.0),
+);
+```
+
+`with_min_repeat_interval` only tracks admissions that themselves set an
+interval, which keeps its bookkeeping bounded; `with_max_distance` measures in
+the XY plane against a `SpatialListener2D`, and never culls a request without a
+position or an app without such a listener.
 
 ### Bring your own pool
 
@@ -325,11 +510,59 @@ usable with any pool, not just the ones this crate spawns.
 
 ### Volume model
 
-| Layer | Location | Updated |
-|-------|----------|---------|
-| Master | `MainBus` `VolumeNode` | On config change |
-| Category | Per-sample `VolumeNode` effect | On config change |
-| Per-play | Baked into `VolumeNode` at spawn | Spawn only |
+A sound's gain is a **product of independently-owned layers**, not a value one
+system writes and another overwrites:
+
+```
+node volume = category volume x BaseVolume x damping x duck
+```
+
+| Factor | Owned by | Lives in |
+|--------|----------|----------|
+| Master | Your `AudioConfig` | `MainBus` `VolumeNode` (its own node, above the rest) |
+| Category | Your `AudioConfig` | recomputed into the product below |
+| `BaseVolume` | The `PlayAudio` request: `.with_volume()` x randomization | a component on the sound |
+| damping | Whichever `SoundDampingField`s reach it | resolved per frame |
+| duck | The mix-wide `DuckingEnvelope` | resolved per frame |
+
+Every system that writes a sound's `VolumeNode` recomputes the whole product
+from those components. That is what makes the layers compose: a volume-slider
+change scales each sound's own level rather than flattening the category onto
+one number, a damping field muffles a quiet ambience bed *relative to how quiet
+it already was*, and handing a sound from the damping system back to the
+config-driven write is seamless in both directions, because both land on the
+same expression with the unused factors at unity.
+
+Two systems never write the same node in one frame. `FadeInAudio`/
+`FadeOutAudio` own a node outright for the fade's duration and everything else
+stands down; `SelfDrivenVolume` says a host system owns one permanently.
+
+### Per-sound baselines
+
+`BaseVolume` and `BasePitch` are the per-sound halves of that model -- the part
+of a sound's gain and speed that belongs to the sound itself, underneath every
+layer that scales it. Both are inserted at spawn (by `PlayAudio`'s handler and
+by the queue on promotion), so nothing has to reverse-engineer them later.
+
+They are ordinary public components, so a host can read or drive them:
+
+```rust
+// Duck one specific loop by hand, without touching the mix-wide envelope.
+commands.entity(engine_loop).insert(BaseVolume(0.3));
+
+// Wind an engine up: a damping field still bends this baseline, rather than
+// replacing it.
+fn rev(mut engines: Query<&mut BasePitch, With<Engine>>, throttle: Res<Throttle>) {
+    for mut pitch in &mut engines {
+        pitch.0 = 1.0 + throttle.0 * 0.5;
+    }
+}
+```
+
+A sound spawned by hand without them reads as `1.0` on both axes -- the bare
+category volume and an unbent pitch. A completed `FadeOutAudio` that keeps its
+entity lands on `BaseVolume::SILENT`, so a later config change re-derives the
+silence instead of reviving the sound at full volume.
 
 ### Voice management
 
@@ -343,6 +576,7 @@ and `PlayQueuedAudio` (see "Virtual Voice Queue" above).
 
 | msg_seedling | bevy_seedling | Bevy |
 |-------------|---------------|------|
+| 0.4         | 0.7           | 0.18 |
 | 0.3         | 0.7           | 0.18 |
 | 0.2         | 0.7           | 0.18 |
 | 0.1         | 0.7           | 0.18 |
