@@ -29,12 +29,15 @@
 
 use bevy::prelude::*;
 
-/// Sanitizes an authored gain: non-finite becomes `0.0`, negative clamps to
-/// `0.0`. Matches the virtual queue's treatment of the same numbers, so a
-/// hostile volume silences a sound rather than inverting its phase or
-/// poisoning a later multiply with `NaN`.
+/// Sanitizes an authored weight — a gain, a volume, a priority: non-finite
+/// becomes `0.0`, negative clamps to `0.0`.
+///
+/// One rule for every number a host hands the crate to multiply with, so a
+/// hostile value silences a sound rather than inverting its phase, and keeps
+/// the virtual queue's ranking a total order rather than poisoning it with
+/// `NaN`.
 #[must_use]
-pub(crate) fn sanitize_gain(value: f32) -> f32 {
+pub(crate) fn sanitize_weight(value: f32) -> f32 {
     if value.is_finite() { value.max(0.0) } else { 0.0 }
 }
 
@@ -69,7 +72,7 @@ impl BaseVolume {
     /// than inverting its phase or poisoning a later multiply with `NaN`.
     #[must_use]
     pub fn new(volume: f32) -> Self {
-        Self(sanitize_gain(volume))
+        Self(sanitize_weight(volume))
     }
 
     /// The gain to write to a volume node for this sound at `category_volume`,

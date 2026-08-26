@@ -127,7 +127,7 @@ use bevy_seedling::prelude::*;
 use bevy_seedling::prelude::PlaybackSettings;
 use bevy_seedling::sample::{AudioSample, QueuedSample};
 
-use crate::baseline::{BasePitch, BaseVolume};
+use crate::baseline::{BasePitch, BaseVolume, sanitize_weight};
 use crate::fade::{FadeInAudio, FadeOutAudio, FadeSystems};
 use crate::messages::SpatialPosition;
 use crate::traits::AudioCategory;
@@ -660,16 +660,6 @@ fn enqueue_queued_audio<C: AudioCategory>(
             priority: sanitize_weight(msg.priority),
             requested_at: now,
         });
-    }
-}
-
-/// Non-finite → `0.0`, otherwise clamped to `>= 0.0`, keeping significance
-/// math and ranking total-order safe.
-fn sanitize_weight(value: f32) -> f32 {
-    if value.is_finite() {
-        value.max(0.0)
-    } else {
-        0.0
     }
 }
 
