@@ -2,6 +2,9 @@ use core::time::Duration;
 
 use bevy::prelude::*;
 use bevy_seedling::prelude::*;
+// Explicit: `bevy::prelude` exports a `PlaybackSettings` of its own and the
+// two globs would otherwise resolve to it.
+use bevy_seedling::prelude::PlaybackSettings;
 
 use crate::baseline::{BasePitch, BaseVolume};
 use crate::fade::FadeOutAudio;

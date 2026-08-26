@@ -122,6 +122,9 @@
 
 use bevy::prelude::*;
 use bevy_seedling::prelude::*;
+// Explicit: `bevy::prelude` exports a `PlaybackSettings` of its own and the
+// two globs would otherwise resolve to it.
+use bevy_seedling::prelude::PlaybackSettings;
 
 use crate::baseline::{BasePitch, BaseVolume};
 use crate::ducking::{DuckingEnvelope, Ducks};
@@ -1125,7 +1128,10 @@ mod tests {
             ron::from_str("(radius: 40.0, cutoff_hz: 800.0)").expect("authored field parses");
         assert_eq!(authored.radius, 40.0);
         assert_eq!(authored.cutoff_hz, 800.0);
-        assert_eq!(authored.volume, 1.0, "an unnamed axis leaves the sound alone");
+        assert_eq!(
+            authored.volume, 1.0,
+            "an unnamed axis leaves the sound alone"
+        );
         assert_eq!(authored.speed, 1.0);
         assert_eq!(authored.targets, DampingTargets::Both);
     }
