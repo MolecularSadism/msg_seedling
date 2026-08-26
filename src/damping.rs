@@ -70,6 +70,15 @@
 //! distance model are authored per game), and any announcement layer (entry/
 //! exit cues, immersion beds) built on top of [`SoundDampingField::influence`].
 //!
+//! ## Authoring fields in data
+//!
+//! The `serde` feature (off by default) derives `Serialize`/`Deserialize` on
+//! [`SoundDampingField`] and [`DampingTargets`], so a host whose content is
+//! authored in RON or JSON can deserialize the component itself instead of
+//! shadowing its five fields in a parallel struct. The field deserializes with
+//! `#[serde(default)]`, so an entry naming only `radius` and `cutoff_hz` is a
+//! muffle that leaves volume and pitch alone.
+//!
 //! ## Example
 //!
 //! ```
@@ -113,6 +122,9 @@
 
 use bevy::prelude::*;
 use bevy_seedling::prelude::*;
+// Explicit: `bevy::prelude` exports a `PlaybackSettings` of its own and the
+// two globs would otherwise resolve to it.
+use bevy_seedling::prelude::PlaybackSettings;
 
 use crate::baseline::{BasePitch, BaseVolume};
 use crate::ducking::{DuckingEnvelope, Ducks};
@@ -136,6 +148,7 @@ const MAX_FIELD_SPEED: f32 = 100.0;
 /// A field always damps a sound *once*, whichever endpoints it covers; this
 /// only decides which endpoints it is allowed to look at.
 #[derive(Reflect, Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum DampingTargets {
     /// Only sources inside the field are damped. The field is something that
     /// swallows the sound made in it, heard from anywhere.
@@ -174,6 +187,11 @@ impl DampingTargets {
 /// against that radius.
 #[derive(Component, Reflect, Debug, Clone, Copy, PartialEq)]
 #[reflect(Component)]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize, serde::Deserialize),
+    serde(default)
+)]
 pub struct SoundDampingField {
     /// Radius of influence in world units. Non-positive disables the field.
     pub radius: f32,
@@ -1099,5 +1117,39 @@ mod tests {
         app.update_n(2);
         let speed = app.world().get::<PlaybackSettings>(unbent).unwrap().speed;
         assert!((speed - 1.0).abs() < 1e-6);
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn an_authored_field_fills_its_unnamed_axes_with_the_default() {
+        // The shape a host writes in a prefab: name the axes the effect is
+        // about, leave the rest alone.
+        let authored: SoundDampingField =
+            ron::from_str("(radius: 40.0, cutoff_hz: 800.0)").expect("authored field parses");
+        assert_eq!(authored.radius, 40.0);
+        assert_eq!(authored.cutoff_hz, 800.0);
+        assert_eq!(
+            authored.volume, 1.0,
+            "an unnamed axis leaves the sound alone"
+        );
+        assert_eq!(authored.speed, 1.0);
+        assert_eq!(authored.targets, DampingTargets::Both);
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn a_field_round_trips_through_ron() {
+        let field = SoundDampingField {
+            radius: 12.0,
+            volume: 0.35,
+            cutoff_hz: 700.0,
+            speed: 0.9,
+            targets: DampingTargets::Listeners,
+        };
+        let text = ron::to_string(&field).expect("field serializes");
+        assert_eq!(
+            ron::from_str::<SoundDampingField>(&text).expect("field parses back"),
+            field
+        );
     }
 }

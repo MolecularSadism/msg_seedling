@@ -9,7 +9,7 @@ Built on the [Firewheel](https://github.com/BillyDM/Firewheel) audio engine via 
 - **Spatial audio** -- 2D/3D positioning with `Option<Vec2>` / `Option<Vec3>`, or parent entity attachment
 - **Randomization** -- configurable per-play volume and speed deviation with plugin-wide defaults
 - **Smooth fading** -- audio-thread ramps for glitch-free fade-outs, reusable `FadeInAudio`/`FadeOutAudio` components for any sample entity, and `FadeMix` for taking the whole bus down at once
-- **Sound damping fields** -- world-space volumes that muffle what crosses them, on volume, low-pass cutoff and pitch at once
+- **Sound damping fields** -- world-space volumes that muffle what crosses them, on volume, low-pass cutoff and pitch at once (authorable in data behind the `serde` feature)
 - **Sidechain ducking** -- one mix-wide envelope that steps the routine mix back so a crucial cue lands
 - **Virtual voice queue** -- opt-in, significance-ranked voice budget that crossfades between sounds instead of hard-cutting when a pool runs out of room; displaced loops wait silently and come back, and admission controls drop the requests not worth queueing
 
@@ -306,6 +306,26 @@ pool effect chain carries a `LowPassNode`, and `bevy_seedling` fixes that chain
 when the pool is created. Route dampable sounds through a pool of your own that
 includes one, parked at `OPEN_CUTOFF_HZ`; everything else is volume- and
 pitch-damped only.
+
+### Authoring fields in data
+
+Enable the `serde` feature and `SoundDampingField`/`DampingTargets` gain
+`Serialize`/`Deserialize`, so a game whose content lives in RON or JSON
+deserializes the component itself rather than shadowing its five fields in a
+parallel struct:
+
+```toml
+msg_seedling = { version = "0.4", features = ["serde"] }
+```
+
+```ron
+// Every axis defaults to leaving the sound alone, so name only the ones the
+// effect is about.
+(radius: 40.0, cutoff_hz: 800.0, targets: Listeners)
+```
+
+The feature is off by default -- nothing in the crate reads or writes a file
+itself, so it costs a `serde` dependency only where a host wants it.
 
 **Geometry is 2D.** Membership is measured in the XY plane, and only
 `SpatialListener2D` counts as a listener -- a `SpatialListener3D` app gets the

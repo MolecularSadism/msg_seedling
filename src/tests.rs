@@ -380,6 +380,9 @@ fn plugin_custom_randomization() {
 
 mod spawned_baselines {
     use bevy_seedling::prelude::*;
+    // Explicit: `bevy::prelude` exports a `PlaybackSettings` of its own and the
+    // two globs would otherwise resolve to it.
+    use bevy_seedling::prelude::PlaybackSettings;
 
     use super::*;
     use crate::baseline::{BasePitch, BaseVolume};
