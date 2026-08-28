@@ -195,8 +195,10 @@ pub use mix_fade::{FadeMix, MixFadePlugin, MixFadeState, MixLevel, fade_target};
 pub use randomization::{DefaultRandomization, Randomization};
 pub use traits::{AudioCategory, AudioConfig};
 pub use virtual_queue::{
-    Audible, PlayQueuedAudio, Retiring, SignificanceEntry, StopQueuedAudio, VirtualSound,
-    VirtualVoiceBudget, VirtualVoiceQueuePlugin, VoiceDecision, rank_by_significance,
+    AdmissionGate, AdmissionRejection, AdmissionRequest, AdmissionState, Audible,
+    DEFAULT_DISPLACEMENT_MARGIN, DisplacementCandidate, PlayQueuedAudio, QueuePoolRouter, Retiring,
+    SignificanceEntry, StopQueuedAudio, VirtualSound, VirtualVoiceBudget, VirtualVoiceQueuePlugin,
+    VoiceDecision, displacement_target, rank_by_significance,
 };
 
 use bevy::prelude::*;

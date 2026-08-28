@@ -315,7 +315,7 @@ deserializes the component itself rather than shadowing its five fields in a
 parallel struct:
 
 ```toml
-msg_seedling = { version = "0.4", features = ["serde"] }
+msg_seedling = { version = "0.5", features = ["serde"] }
 ```
 
 ```ron
@@ -525,11 +525,45 @@ position or an app without such a listener.
 
 ### Bring your own pool
 
-`VirtualVoiceQueuePlugin` always promotes into seedling's built-in
-`SpatialPool`/`DefaultPool`. If your game needs a different pool -- one with
-a custom effects chain (a low-pass filter for a muffling system, say) -- the
-ranking decision itself is exposed as a pure function so you can drive your
-own promotion/demotion and still get the crossfade for free:
+Two levels, depending on how much of the queue you want to replace.
+
+**Keep the plugin, swap the promotion target.** `VirtualVoiceQueuePlugin`
+promotes into seedling's built-in `SpatialPool`/`DefaultPool` by default; a
+`QueuePoolRouter` replaces just that routing -- say, into your own pool with
+a low-pass node in its effects chain -- while every other queue behavior
+stays:
+
+```rust
+app.add_plugins(
+    VirtualVoiceQueuePlugin::<Sound>::new().with_pool_router(QueuePoolRouter::new(
+        // At promotion, on the entry about to get its `SamplePlayer`:
+        // insert your pool label, choosing per entry.
+        |ec, sound| {
+            match sound.category() {
+                Sound::Critical => ec.insert(CriticalSpatialPool),
+                _ => ec.insert(DampableSpatialPool),
+            };
+        },
+        // At release: remove what `route` inserted.
+        |ec| {
+            ec.remove::<(CriticalSpatialPool, DampableSpatialPool)>();
+        },
+    )),
+);
+```
+
+**Drive your own promotion/demotion.** The queue's whole decision layer is
+public, so a host with its own request pipeline and pools reuses it
+piecewise instead of duplicating it:
+
+- `AdmissionGate` runs the admission controls above -- the global frame
+  budget plus the per-sample frame cap, concurrency cap, repeat interval and
+  distance cull -- over the same `AdmissionState<C>` resource the plugin
+  uses, against any request type shaped into an `AdmissionRequest`
+  (`PlayQueuedAudio::admission_request()` produces one). The plugin's own
+  enqueue system is built on this gate, so semantics match control for
+  control, and `AdmissionRejection` says which control dropped a request.
+- `rank_by_significance` decides which of a whole set should be audible:
 
 ```rust
 use msg_seedling::{FadeInAudio, FadeOutAudio, SignificanceEntry, VoiceDecision, rank_by_significance};
@@ -538,6 +572,28 @@ let decisions = rank_by_significance(&entries, max_audible, retiring_count);
 // For each `VoiceDecision::Promote`: insert your own pool marker + effects
 // chain + `FadeInAudio::new(crossfade, target_volume)`.
 // For each `VoiceDecision::Demote`: insert `FadeOutAudio::new(crossfade)`.
+```
+
+- `displacement_target` answers the pairwise steal-on-arrival question
+  instead -- does this newcomer outrank the weakest voice it may displace?
+  -- with an optional *hard* tier above significance, the guarantee a raw
+  priority weight cannot make: a higher tier always displaces a lower one
+  however the loudness compares, a lower tier never displaces a higher one,
+  and same-tier contests use the usual incumbent-bonus hysteresis:
+
+```rust
+use msg_seedling::{DEFAULT_DISPLACEMENT_MARGIN, DisplacementCandidate, displacement_target};
+
+#[derive(PartialEq, Eq, PartialOrd, Ord)]
+enum Tier { Low, Normal, Critical }
+
+// The entity of the voice to steal, or None if the newcomer shouldn't play.
+let victim = displacement_target(
+    &candidates, // one `DisplacementCandidate` per live voice
+    &Tier::Critical,
+    newcomer_significance,
+    DEFAULT_DISPLACEMENT_MARGIN,
+);
 ```
 
 `FadeInAudio`/`FadeOutAudio` only need `SampleEffects` to work, so they're
