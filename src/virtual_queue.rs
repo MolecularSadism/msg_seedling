@@ -64,6 +64,26 @@
 //! [`PlayQueuedAudio::with_priority`] before sending, if the caller can
 //! compute it (e.g. from a listener position it already tracks).
 //!
+//! # Bring your own pool
+//!
+//! The queue's decision layer is public for hosts that drive their own
+//! sampler pools instead of adding [`VirtualVoiceQueuePlugin`]:
+//!
+//! - [`AdmissionGate`] runs the admission controls — the global per-frame
+//!   budget plus [`AdmissionRequest`]'s per-sample caps, repeat interval and
+//!   distance cull — over the same [`AdmissionState`] resource the plugin
+//!   uses. The plugin's own enqueue system is built on it, so a host gating
+//!   its own request stream gets identical semantics.
+//! - [`rank_by_significance`] answers "which of this whole set should be
+//!   audible".
+//! - [`displacement_target`] answers the pairwise question instead — "does
+//!   this newcomer outrank the weakest voice it may displace" — with an
+//!   optional hard tier ordering above significance.
+//!
+//! A host that only needs a different promotion *target* — its own pool
+//! labels, its own effects chain — keeps the whole plugin and swaps the
+//! routing via [`VirtualVoiceQueuePlugin::with_pool_router`].
+//!
 //! # Example
 //!
 //! ```
@@ -115,9 +135,12 @@
 //! app.update();
 //! ```
 
+use core::cmp::Ordering;
 use core::time::Duration;
+use std::sync::Arc;
 
 use bevy::ecs::entity::Entities;
+use bevy::ecs::system::EntityCommands;
 use bevy::prelude::*;
 use bevy_seedling::pool::label::PoolLabelContainer;
 use bevy_seedling::pool::{CompletionReason, Sampler};
@@ -136,7 +159,13 @@ const DEFAULT_MAX_AUDIBLE: usize = 16;
 const DEFAULT_CROSSFADE: Duration = Duration::from_millis(50);
 const DEFAULT_MAX_WAIT: Duration = Duration::from_millis(500);
 const DEFAULT_SAMPLE_PRIORITY: i32 = 2;
-const DEFAULT_DISPLACEMENT_MARGIN: f32 = 1.25;
+
+/// Default incumbent-bonus displacement margin (~2 dB): a newcomer must be
+/// this factor more significant than an audible voice to displace it. Used
+/// by [`VirtualVoiceBudget::displacement_margin`], and the value to reach
+/// for as [`displacement_target`]'s `margin` unless you have a reason not
+/// to.
+pub const DEFAULT_DISPLACEMENT_MARGIN: f32 = 1.25;
 
 /// Budget for one category type's significance-ranked voice queue.
 ///
@@ -269,6 +298,24 @@ impl<C: AudioCategory> VirtualSound<C> {
     #[must_use]
     pub fn looping(&self) -> bool {
         self.looping
+    }
+
+    /// The sample this sound plays.
+    #[must_use]
+    pub fn handle(&self) -> &Handle<AudioSample> {
+        &self.handle
+    }
+
+    /// The parent entity this sound attaches to, if any.
+    #[must_use]
+    pub fn parent(&self) -> Option<Entity> {
+        self.parent
+    }
+
+    /// The spatial position this sound was requested at, if any.
+    #[must_use]
+    pub fn position(&self) -> Option<SpatialPosition> {
+        self.position
     }
 }
 
@@ -414,6 +461,20 @@ impl<C: AudioCategory> PlayQueuedAudio<C> {
         self.max_distance = max_distance.is_finite().then_some(max_distance.max(0.0));
         self
     }
+
+    /// The admission-control slice of this request, in the shape
+    /// [`AdmissionGate::try_admit`] takes.
+    #[must_use]
+    pub fn admission_request(&self) -> AdmissionRequest {
+        AdmissionRequest {
+            sample: self.handle.id(),
+            position: self.position.map(|position| position.as_vec3().truncate()),
+            max_concurrent: self.max_concurrent,
+            max_per_frame: self.max_per_frame,
+            min_repeat_interval: self.min_repeat_interval,
+            max_distance: self.max_distance,
+        }
+    }
 }
 
 /// Message: stop entries in the virtual voice queue for category type `C`.
@@ -459,6 +520,62 @@ impl<C: AudioCategory> StopQueuedAudio<C> {
     }
 }
 
+/// Where promoted voices go: the pool routing behind
+/// [`VirtualVoiceQueuePlugin`], pluggable per category type.
+///
+/// The default routes exactly as the queue always has: spatial entries (a
+/// parent or a position) into seedling's `SpatialPool`, the rest into
+/// `DefaultPool`. A host with its own `PoolLabel` set — say a dampable pool
+/// with a low-pass node in its chain and a critical pool without — swaps the
+/// routing via [`VirtualVoiceQueuePlugin::with_pool_router`] and keeps every
+/// other queue behavior:
+///
+/// - `route` runs at promotion, on the entry about to receive its
+///   `SamplePlayer`: insert your pool label (and anything else the pool
+///   expects) there, choosing by the entry's [`VirtualSound::category`],
+///   [`VirtualSound::position`], and so on.
+/// - `release` runs when the voice is released — a demotion fade completing,
+///   a stop, or seedling ending the voice: remove what `route` inserted, so
+///   the entry returns to a bare virtual state (label removal is cheap
+///   whether or not this particular promotion inserted it, which is why the
+///   default removes both built-in labels unconditionally).
+#[derive(Resource, Clone)]
+pub struct QueuePoolRouter<C: AudioCategory> {
+    route: Arc<dyn Fn(&mut EntityCommands, &VirtualSound<C>) + Send + Sync>,
+    release: Arc<dyn Fn(&mut EntityCommands) + Send + Sync>,
+}
+
+impl<C: AudioCategory> QueuePoolRouter<C> {
+    /// Creates a router from a promotion-time `route` and its release-time
+    /// inverse.
+    pub fn new(
+        route: impl Fn(&mut EntityCommands, &VirtualSound<C>) + Send + Sync + 'static,
+        release: impl Fn(&mut EntityCommands) + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            route: Arc::new(route),
+            release: Arc::new(release),
+        }
+    }
+}
+
+impl<C: AudioCategory> Default for QueuePoolRouter<C> {
+    fn default() -> Self {
+        Self::new(
+            |ec, sound| {
+                if sound.parent.is_some() || sound.position.is_some() {
+                    ec.insert(SpatialPool);
+                } else {
+                    ec.insert(DefaultPool);
+                }
+            },
+            |ec| {
+                ec.remove::<(SpatialPool, DefaultPool)>();
+            },
+        )
+    }
+}
+
 /// Plugin adding a significance-ranked virtual voice queue for category `C`.
 ///
 /// Independent of [`MsgSeedlingPlugin`](crate::MsgSeedlingPlugin) — add both
@@ -474,12 +591,14 @@ impl<C: AudioCategory> StopQueuedAudio<C> {
 /// `PoolSize` to fit `max_audible` plus expected concurrent crossfades.
 pub struct VirtualVoiceQueuePlugin<C: AudioCategory> {
     budget: VirtualVoiceBudget<C>,
+    pool_router: QueuePoolRouter<C>,
 }
 
 impl<C: AudioCategory> Default for VirtualVoiceQueuePlugin<C> {
     fn default() -> Self {
         Self {
             budget: VirtualVoiceBudget::default(),
+            pool_router: QueuePoolRouter::default(),
         }
     }
 }
@@ -497,6 +616,14 @@ impl<C: AudioCategory> VirtualVoiceQueuePlugin<C> {
         self.budget = budget;
         self
     }
+
+    /// Sets where promoted voices go, replacing the default
+    /// `SpatialPool`/`DefaultPool` routing.
+    #[must_use]
+    pub fn with_pool_router(mut self, pool_router: QueuePoolRouter<C>) -> Self {
+        self.pool_router = pool_router;
+        self
+    }
 }
 
 impl<C: AudioCategory> Plugin for VirtualVoiceQueuePlugin<C> {
@@ -510,6 +637,7 @@ impl<C: AudioCategory> Plugin for VirtualVoiceQueuePlugin<C> {
         app.init_resource::<C::Config>();
         app.init_resource::<AdmissionState<C>>();
         app.insert_resource(self.budget.clone());
+        app.insert_resource(self.pool_router.clone());
         app.add_message::<PlayQueuedAudio<C>>();
         app.add_message::<StopQueuedAudio<C>>();
         app.add_systems(
@@ -535,12 +663,16 @@ impl<C: AudioCategory> Plugin for VirtualVoiceQueuePlugin<C> {
 /// Per-category admission bookkeeping: when each sample was last admitted,
 /// for [`PlayQueuedAudio::min_repeat_interval`].
 ///
+/// [`VirtualVoiceQueuePlugin`] initializes it; a bring-your-own-pool host
+/// gating its own request stream through [`AdmissionGate`] initializes it
+/// itself (`app.init_resource::<AdmissionState<C>>()`).
+///
 /// Bounded however many distinct samples stream through a session: only
 /// admissions that carry an interval are recorded, and once the map grows
 /// past a threshold, entries older than the longest interval seen — too old
 /// to ever block a request again — are pruned before recording more.
 #[derive(Resource)]
-pub(crate) struct AdmissionState<C: AudioCategory> {
+pub struct AdmissionState<C: AudioCategory> {
     last_admitted: bevy::platform::collections::HashMap<AssetId<AudioSample>, Duration>,
     /// The longest interval any recorded admission carried; the prune
     /// horizon.
@@ -577,6 +709,211 @@ impl<C: AudioCategory> AdmissionState<C> {
     }
 }
 
+/// The admission-control slice of one request, decoupled from
+/// [`PlayQueuedAudio`] so a bring-your-own-pool host can gate its own
+/// request type through [`AdmissionGate`]. Every control defaults to off — a
+/// request using none of them is always admitted (up to the gate's global
+/// frame budget).
+///
+/// [`PlayQueuedAudio::admission_request`] produces one from a queue request;
+/// each field mirrors the [`PlayQueuedAudio`] field of the same name.
+#[derive(Clone, Debug)]
+pub struct AdmissionRequest {
+    /// The sample being requested; the per-sample controls key on its id.
+    pub sample: AssetId<AudioSample>,
+    /// XY world position, measured against listeners for
+    /// [`Self::max_distance`]. `None` is never distance-culled.
+    pub position: Option<Vec2>,
+    /// Cap on live entries playing this same sample; see
+    /// [`PlayQueuedAudio::max_concurrent`].
+    pub max_concurrent: Option<usize>,
+    /// Cap on admissions of this same sample within one frame; see
+    /// [`PlayQueuedAudio::max_per_frame`].
+    pub max_per_frame: Option<usize>,
+    /// Minimum time since this same sample was last admitted *with an
+    /// interval*; see [`PlayQueuedAudio::min_repeat_interval`].
+    pub min_repeat_interval: Option<Duration>,
+    /// Maximum distance from the nearest listener worth admitting at; see
+    /// [`PlayQueuedAudio::max_distance`].
+    pub max_distance: Option<f32>,
+}
+
+impl AdmissionRequest {
+    /// Creates a request for `sample` with every control off.
+    #[must_use]
+    pub fn new(sample: AssetId<AudioSample>) -> Self {
+        Self {
+            sample,
+            position: None,
+            max_concurrent: None,
+            max_per_frame: None,
+            min_repeat_interval: None,
+            max_distance: None,
+        }
+    }
+
+    /// Sets the XY position [`Self::max_distance`] measures from.
+    #[must_use]
+    pub fn at(mut self, position: Vec2) -> Self {
+        self.position = Some(position);
+        self
+    }
+
+    /// Caps live entries playing this same sample.
+    #[must_use]
+    pub fn with_max_concurrent(mut self, max_concurrent: usize) -> Self {
+        self.max_concurrent = Some(max_concurrent);
+        self
+    }
+
+    /// Caps admissions of this same sample within one frame.
+    #[must_use]
+    pub fn with_max_per_frame(mut self, max_per_frame: usize) -> Self {
+        self.max_per_frame = Some(max_per_frame);
+        self
+    }
+
+    /// Sets the minimum time since this same sample was last admitted.
+    #[must_use]
+    pub fn with_min_repeat_interval(mut self, interval: Duration) -> Self {
+        self.min_repeat_interval = Some(interval);
+        self
+    }
+
+    /// Culls the request when farther than this from the nearest listener.
+    /// Sanitized like [`PlayQueuedAudio::with_max_distance`]: a non-finite
+    /// distance is discarded (never culls), a negative one clamps to `0.0`.
+    #[must_use]
+    pub fn with_max_distance(mut self, max_distance: f32) -> Self {
+        self.max_distance = max_distance.is_finite().then_some(max_distance.max(0.0));
+        self
+    }
+}
+
+/// Why [`AdmissionGate::try_admit`] rejected a request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AdmissionRejection {
+    /// The gate's global per-frame budget is spent
+    /// ([`VirtualVoiceBudget::max_admissions_per_frame`]).
+    FrameBudgetSpent,
+    /// This sample already hit its [`AdmissionRequest::max_per_frame`] this
+    /// frame.
+    PerFrameCap,
+    /// This sample already has [`AdmissionRequest::max_concurrent`] live
+    /// entries (same-frame admissions included).
+    ConcurrentCap,
+    /// This sample was last admitted less than
+    /// [`AdmissionRequest::min_repeat_interval`] ago.
+    RepeatTooSoon,
+    /// The request's position is farther than
+    /// [`AdmissionRequest::max_distance`] from the nearest listener.
+    TooFar,
+}
+
+/// One frame's admission gate: the significance queue's admission controls,
+/// pool-agnostic, for hosts gating their own request stream.
+///
+/// Create one per frame over the category's [`AdmissionState`] and feed it
+/// each request in arrival order; [`Self::try_admit`] answers per request
+/// and does the bookkeeping (frame counters, repeat-interval recording) for
+/// the ones that pass. [`VirtualVoiceQueuePlugin`]'s own enqueue system is
+/// implemented on this same gate, so a host running it against its own
+/// requests gets identical semantics, control for control.
+pub struct AdmissionGate<'a, C: AudioCategory> {
+    state: &'a mut AdmissionState<C>,
+    frame_budget: Option<usize>,
+    now: Duration,
+    admitted: usize,
+    admitted_per_sample: bevy::platform::collections::HashMap<AssetId<AudioSample>, usize>,
+}
+
+impl<'a, C: AudioCategory> AdmissionGate<'a, C> {
+    /// Opens the gate for one frame. `frame_budget` caps admissions across
+    /// every sound this frame (the queue passes
+    /// [`VirtualVoiceBudget::max_admissions_per_frame`]; `None` admits
+    /// everything); `now` is the current [`Time::elapsed`].
+    #[must_use]
+    pub fn new(
+        state: &'a mut AdmissionState<C>,
+        frame_budget: Option<usize>,
+        now: Duration,
+    ) -> Self {
+        Self {
+            state,
+            frame_budget,
+            now,
+            admitted: 0,
+            admitted_per_sample: Default::default(),
+        }
+    }
+
+    /// How many requests this gate has admitted so far.
+    #[must_use]
+    pub fn admitted(&self) -> usize {
+        self.admitted
+    }
+
+    /// Checks one request against every admission control and, when it
+    /// passes, records the admission.
+    ///
+    /// The environment comes in as closures so it is only computed for
+    /// requests that actually set the control needing it: `live_count`
+    /// counts the live entries already playing the request's sample from
+    /// *before* this frame's admissions — the gate adds this frame's own —
+    /// where "live" for the queue means virtual or audible, retiring
+    /// excluded; `nearest_listener_distance` is the distance from the given
+    /// position to the nearest listener, `None` when there is no listener to
+    /// measure against (which never culls). The queue measures XY distance
+    /// to `SpatialListener2D`s; a host measures however its geometry works.
+    pub fn try_admit(
+        &mut self,
+        request: &AdmissionRequest,
+        live_count: impl FnOnce() -> usize,
+        nearest_listener_distance: impl FnOnce(Vec2) -> Option<f32>,
+    ) -> Result<(), AdmissionRejection> {
+        if let Some(cap) = self.frame_budget
+            && self.admitted >= cap
+        {
+            return Err(AdmissionRejection::FrameBudgetSpent);
+        }
+
+        let same_this_frame = self
+            .admitted_per_sample
+            .get(&request.sample)
+            .copied()
+            .unwrap_or(0);
+        if let Some(cap) = request.max_per_frame
+            && same_this_frame >= cap
+        {
+            return Err(AdmissionRejection::PerFrameCap);
+        }
+        if let Some(cap) = request.max_concurrent
+            && live_count() + same_this_frame >= cap
+        {
+            return Err(AdmissionRejection::ConcurrentCap);
+        }
+        if let Some(interval) = request.min_repeat_interval
+            && let Some(&last) = self.state.last_admitted.get(&request.sample)
+            && self.now.saturating_sub(last) < interval
+        {
+            return Err(AdmissionRejection::RepeatTooSoon);
+        }
+        if let Some(max_distance) = request.max_distance
+            && let Some(position) = request.position
+            && nearest_listener_distance(position).is_some_and(|distance| distance > max_distance)
+        {
+            return Err(AdmissionRejection::TooFar);
+        }
+
+        self.admitted += 1;
+        *self.admitted_per_sample.entry(request.sample).or_insert(0) += 1;
+        if let Some(interval) = request.min_repeat_interval {
+            self.state.record(request.sample, self.now, interval);
+        }
+        Ok(())
+    }
+}
+
 fn enqueue_queued_audio<C: AudioCategory>(
     mut commands: Commands,
     time: Res<Time>,
@@ -587,68 +924,35 @@ fn enqueue_queued_audio<C: AudioCategory>(
     q_listeners: Query<&GlobalTransform, With<SpatialListener2D>>,
 ) {
     let now = time.elapsed();
-    let mut admitted_this_frame = 0usize;
-    let mut admitted_per_handle: bevy::platform::collections::HashMap<AssetId<AudioSample>, usize> =
-        Default::default();
+    let mut gate = AdmissionGate::new(&mut admission, budget.max_admissions_per_frame, now);
     // Resolved lazily: most frames have no distance-culled request.
     let mut listener_positions: Option<Vec<Vec2>> = None;
 
     for msg in messages.read() {
-        // Every admission control defaults to off; a request using none of
-        // them is admitted exactly as before.
-        if let Some(cap) = budget.max_admissions_per_frame
-            && admitted_this_frame >= cap
-        {
-            continue;
-        }
-
-        let id = msg.handle.id();
-        let same_this_frame = admitted_per_handle.get(&id).copied().unwrap_or(0);
-        if let Some(cap) = msg.max_per_frame
-            && same_this_frame >= cap
-        {
-            continue;
-        }
-        if let Some(cap) = msg.max_concurrent {
-            let live = existing
-                .iter()
-                .filter(|sound| sound.handle.id() == id)
-                .count()
-                + same_this_frame;
-            if live >= cap {
-                continue;
-            }
-        }
-        if let Some(interval) = msg.min_repeat_interval
-            && let Some(&last) = admission.last_admitted.get(&id)
-            && now.saturating_sub(last) < interval
-        {
-            continue;
-        }
-        if let Some(max_distance) = msg.max_distance
-            && let Some(position) = msg.position
-        {
-            let listeners = listener_positions.get_or_insert_with(|| {
-                q_listeners
+        let request = msg.admission_request();
+        let admitted = gate.try_admit(
+            &request,
+            || {
+                existing
                     .iter()
-                    .map(|transform| transform.translation().truncate())
-                    .collect()
-            });
-            let position = position.as_vec3().truncate();
-            let culled = listeners
-                .iter()
-                .map(|listener| listener.distance(position))
-                .min_by(f32::total_cmp)
-                .is_some_and(|distance| distance > max_distance);
-            if culled {
-                continue;
-            }
-        }
-
-        admitted_this_frame += 1;
-        *admitted_per_handle.entry(id).or_insert(0) += 1;
-        if let Some(interval) = msg.min_repeat_interval {
-            admission.record(id, now, interval);
+                    .filter(|sound| sound.handle.id() == request.sample)
+                    .count()
+            },
+            |position| {
+                listener_positions
+                    .get_or_insert_with(|| {
+                        q_listeners
+                            .iter()
+                            .map(|transform| transform.translation().truncate())
+                            .collect()
+                    })
+                    .iter()
+                    .map(|listener| listener.distance(position))
+                    .min_by(f32::total_cmp)
+            },
+        );
+        if admitted.is_err() {
+            continue;
         }
         commands.spawn(VirtualSound {
             handle: msg.handle.clone(),
@@ -745,9 +1049,133 @@ pub fn rank_by_significance(
         .collect()
 }
 
+/// One audible voice as a candidate for [`displacement_target`].
+///
+/// `tier` is an optional *hard* priority layer above significance: a
+/// higher-tier newcomer displaces a lower-tier voice regardless of how the
+/// significances compare, and a lower-tier newcomer never displaces a
+/// higher-tier voice, however loud — the guarantee a raw
+/// [`PlayQueuedAudio::priority`] weight cannot make. The default `()` puts
+/// every candidate in the same tier, leaving pure significance with
+/// hysteresis.
+#[derive(Clone, Copy, Debug)]
+pub struct DisplacementCandidate<T = ()> {
+    /// The voice's entity, returned when it is the displacement target.
+    pub entity: Entity,
+    /// The voice's audible significance (volume × priority weight),
+    /// sanitized upstream like [`rank_by_significance`]'s inputs.
+    pub significance: f32,
+    /// The voice's hard priority tier; higher [`Ord`] wins.
+    pub tier: T,
+}
+
+impl DisplacementCandidate {
+    /// A candidate with no tier: displacement resolves on significance and
+    /// margin alone.
+    #[must_use]
+    pub fn new(entity: Entity, significance: f32) -> Self {
+        Self {
+            entity,
+            significance,
+            tier: (),
+        }
+    }
+}
+
+impl<T> DisplacementCandidate<T> {
+    /// Places the candidate in a hard priority tier.
+    #[must_use]
+    pub fn with_tier<U: Ord>(self, tier: U) -> DisplacementCandidate<U> {
+        DisplacementCandidate {
+            entity: self.entity,
+            significance: self.significance,
+            tier,
+        }
+    }
+}
+
+/// Answers the displacement question [`rank_by_significance`] does not: does
+/// this *newcomer* outrank the weakest voice it may displace?
+///
+/// [`rank_by_significance`] decides which of a whole set should be audible.
+/// A host that instead admits one request at a time against a full set of
+/// live voices — steal-on-arrival, the way sampler pools usually work —
+/// needs the pairwise question. The weakest candidate is the minimum by
+/// `tier` first, significance within the tier; the newcomer displaces it
+/// when:
+///
+/// - its tier is strictly higher — the hard gate; symmetrically, a
+///   lower-tier newcomer displaces nothing (if it cannot beat the weakest,
+///   it cannot beat any), or
+/// - the tiers are equal and its significance exceeds the incumbent's times
+///   `margin` — the same incumbent-bonus hysteresis as
+///   [`VirtualVoiceBudget::displacement_margin`], so pass
+///   [`DEFAULT_DISPLACEMENT_MARGIN`] unless you tuned it. Sanitized like the
+///   budget's: non-finite becomes `1.0`, and clamped to `>= 1.0`.
+///
+/// Returns the entity to displace, or `None` when the newcomer should not
+/// play. An empty `candidates` returns `None` too — no live voices means a
+/// free slot, not a displacement. Ties for weakest resolve to the earliest
+/// candidate in input order, matching [`rank_by_significance`]'s tie rule.
+///
+/// ```
+/// use bevy::prelude::Entity;
+/// use msg_seedling::virtual_queue::{
+///     DEFAULT_DISPLACEMENT_MARGIN, DisplacementCandidate, displacement_target,
+/// };
+///
+/// #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+/// enum Tier {
+///     Low,
+///     Critical,
+/// }
+///
+/// let loud_chatter = Entity::PLACEHOLDER;
+/// let candidates = [DisplacementCandidate::new(loud_chatter, 8.0).with_tier(Tier::Low)];
+///
+/// // A quiet critical cue displaces arbitrarily loud low-tier voices...
+/// let target = displacement_target(
+///     &candidates,
+///     &Tier::Critical,
+///     0.1,
+///     DEFAULT_DISPLACEMENT_MARGIN,
+/// );
+/// assert_eq!(target, Some(loud_chatter));
+///
+/// // ...while a same-tier newcomer must beat the incumbent by the margin.
+/// let target = displacement_target(&candidates, &Tier::Low, 9.0, DEFAULT_DISPLACEMENT_MARGIN);
+/// assert_eq!(target, None);
+/// ```
+#[must_use]
+pub fn displacement_target<T: Ord>(
+    candidates: &[DisplacementCandidate<T>],
+    newcomer_tier: &T,
+    newcomer_significance: f32,
+    margin: f32,
+) -> Option<Entity> {
+    let margin = if margin.is_finite() {
+        margin.max(1.0)
+    } else {
+        1.0
+    };
+    let weakest = candidates.iter().min_by(|a, b| {
+        a.tier
+            .cmp(&b.tier)
+            .then_with(|| a.significance.total_cmp(&b.significance))
+    })?;
+    match newcomer_tier.cmp(&weakest.tier) {
+        Ordering::Greater => Some(weakest.entity),
+        Ordering::Equal if newcomer_significance > weakest.significance * margin => {
+            Some(weakest.entity)
+        }
+        _ => None,
+    }
+}
+
 fn rank_virtual_voices<C: AudioCategory>(
     mut commands: Commands,
     budget: Res<VirtualVoiceBudget<C>>,
+    router: Res<QueuePoolRouter<C>>,
     config: Res<C::Config>,
     time: Res<Time>,
     entities: &Entities,
@@ -794,7 +1222,14 @@ fn rank_virtual_voices<C: AudioCategory>(
     {
         match decision {
             VoiceDecision::Promote => {
-                promote(&mut commands, entity, sound, *target_volume, &budget);
+                promote(
+                    &mut commands,
+                    entity,
+                    sound,
+                    *target_volume,
+                    &budget,
+                    &router,
+                );
             }
             VoiceDecision::Demote => {
                 demote(&mut commands, entity, sound.looping, budget.crossfade);
@@ -825,6 +1260,7 @@ fn promote<C: AudioCategory>(
     sound: &VirtualSound<C>,
     target_volume: f32,
     budget: &VirtualVoiceBudget<C>,
+    router: &QueuePoolRouter<C>,
 ) {
     let mut player = SamplePlayer::new(sound.handle.clone());
     if sound.looping {
@@ -850,11 +1286,7 @@ fn promote<C: AudioCategory>(
         Audible,
         Name::new(format!("{:?}", sound.category)),
     ));
-    if sound.parent.is_some() || sound.position.is_some() {
-        ec.insert(SpatialPool);
-    } else {
-        ec.insert(DefaultPool);
-    }
+    (router.route)(&mut ec, sound);
     if let Some(parent) = sound.parent {
         ec.insert((ChildOf(parent), Transform::default()));
     } else if let Some(position) = sound.position {
@@ -882,13 +1314,14 @@ fn demote(commands: &mut Commands, entity: Entity, looping: bool, crossfade: Dur
 /// completes ([`FadeOutAudio`] removes itself, leaving `Retiring` behind).
 fn finish_demotions<C: AudioCategory>(
     mut commands: Commands,
+    router: Res<QueuePoolRouter<C>>,
     finished: Query<
         (Entity, Has<Sampler>),
         (With<VirtualSound<C>>, With<Retiring>, Without<FadeOutAudio>),
     >,
 ) {
     for (entity, has_sampler) in &finished {
-        release_voice::<C>(&mut commands, entity, has_sampler);
+        release_voice::<C>(&mut commands, entity, has_sampler, &router);
     }
 }
 
@@ -897,6 +1330,7 @@ fn finish_demotions<C: AudioCategory>(
 /// return to virtual for re-promotion, finished or dead one-shots despawn.
 fn reclaim_lost_voices<C: AudioCategory>(
     mut commands: Commands,
+    router: Res<QueuePoolRouter<C>>,
     lost: Query<
         (Entity, &VirtualSound<C>, Has<Sampler>),
         (With<Audible>, Without<SamplePlayer>, Without<Retiring>),
@@ -904,18 +1338,24 @@ fn reclaim_lost_voices<C: AudioCategory>(
 ) {
     for (entity, sound, has_sampler) in &lost {
         if sound.looping {
-            release_voice::<C>(&mut commands, entity, has_sampler);
+            release_voice::<C>(&mut commands, entity, has_sampler, &router);
         } else {
             commands.entity(entity).despawn();
         }
     }
 }
 
-/// Strips everything a promotion added — the bare `C` component and the
-/// per-sound baselines included — leaving a bare [`VirtualSound`] entry
-/// eligible for re-promotion. The entry's authored volume survives in
-/// [`VirtualSound::base_volume`], so the next promotion restores it.
-fn release_voice<C: AudioCategory>(commands: &mut Commands, entity: Entity, has_sampler: bool) {
+/// Strips everything a promotion added — the bare `C` component, the
+/// per-sound baselines, and (through the router's release hook) the pool
+/// label — leaving a bare [`VirtualSound`] entry eligible for re-promotion.
+/// The entry's authored volume survives in `VirtualSound::base_volume`, so
+/// the next promotion restores it.
+fn release_voice<C: AudioCategory>(
+    commands: &mut Commands,
+    entity: Entity,
+    has_sampler: bool,
+    router: &QueuePoolRouter<C>,
+) {
     // A live sampler needs seedling's completion observer (when
     // `SeedlingPlugin` is present) to release it and strip its private
     // bookkeeping. On the reclaim path seedling already completed the voice
@@ -928,9 +1368,9 @@ fn release_voice<C: AudioCategory>(commands: &mut Commands, entity: Entity, has_
             reason: CompletionReason::PlaybackInterrupted,
         });
     }
-    commands
-        .entity(entity)
-        .despawn_related::<SampleEffects>()
+    let mut ec = commands.entity(entity);
+    (router.release)(&mut ec);
+    ec.despawn_related::<SampleEffects>()
         .remove_with_requires::<SamplePlayer>()
         .remove::<(
             C,
@@ -940,8 +1380,6 @@ fn release_voice<C: AudioCategory>(commands: &mut Commands, entity: Entity, has_
             QueuedSample,
             AudioEvents,
             PoolLabelContainer,
-            SpatialPool,
-            DefaultPool,
             Audible,
             Retiring,
             FadeInAudio,
@@ -1967,8 +2405,9 @@ mod tests {
         // re-promote the entry (it is still the only one, and the budget has
         // room), putting the baselines straight back.
         {
+            let router = QueuePoolRouter::<TestSound>::default();
             let world = app.world_mut();
-            release_voice::<TestSound>(&mut world.commands(), voice, false);
+            release_voice::<TestSound>(&mut world.commands(), voice, false, &router);
             world.flush();
         }
 
@@ -2054,5 +2493,325 @@ mod tests {
             .map(|sound| sound.handle.clone())
             .collect();
         assert_eq!(remaining, vec![handle(2)]);
+    }
+
+    // ==================== Pool-agnostic admission gate ====================
+
+    /// Admits with an empty environment: no live entries, no listener.
+    fn admit(
+        gate: &mut AdmissionGate<'_, TestSound>,
+        request: &AdmissionRequest,
+    ) -> Result<(), AdmissionRejection> {
+        gate.try_admit(request, || 0, |_| None)
+    }
+
+    #[test]
+    fn gate_frame_budget_caps_across_samples() {
+        let mut state = AdmissionState::<TestSound>::default();
+        let mut gate = AdmissionGate::new(&mut state, Some(2), Duration::ZERO);
+
+        assert_eq!(
+            admit(&mut gate, &AdmissionRequest::new(handle(1).id())),
+            Ok(())
+        );
+        assert_eq!(
+            admit(&mut gate, &AdmissionRequest::new(handle(2).id())),
+            Ok(())
+        );
+        assert_eq!(
+            admit(&mut gate, &AdmissionRequest::new(handle(3).id())),
+            Err(AdmissionRejection::FrameBudgetSpent)
+        );
+        assert_eq!(gate.admitted(), 2);
+    }
+
+    #[test]
+    fn gate_per_frame_cap_is_per_sample() {
+        let mut state = AdmissionState::<TestSound>::default();
+        let mut gate = AdmissionGate::new(&mut state, None, Duration::ZERO);
+        let capped = AdmissionRequest::new(handle(1).id()).with_max_per_frame(1);
+
+        assert_eq!(admit(&mut gate, &capped), Ok(()));
+        assert_eq!(
+            admit(&mut gate, &capped),
+            Err(AdmissionRejection::PerFrameCap)
+        );
+        // Another sample is untouched by the first one's cap.
+        assert_eq!(
+            admit(
+                &mut gate,
+                &AdmissionRequest::new(handle(2).id()).with_max_per_frame(1)
+            ),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn gate_concurrent_cap_counts_live_plus_this_frame() {
+        let mut state = AdmissionState::<TestSound>::default();
+        let mut gate = AdmissionGate::new(&mut state, None, Duration::ZERO);
+        let request = AdmissionRequest::new(handle(1).id()).with_max_concurrent(2);
+
+        // One live from before this frame, none admitted yet: room for one.
+        assert_eq!(gate.try_admit(&request, || 1, |_| None), Ok(()));
+        // The gate's own admission now counts toward the cap.
+        assert_eq!(
+            gate.try_admit(&request, || 1, |_| None),
+            Err(AdmissionRejection::ConcurrentCap)
+        );
+    }
+
+    #[test]
+    fn gate_repeat_interval_spans_frames_and_ignores_interval_less_admissions() {
+        let mut state = AdmissionState::<TestSound>::default();
+        let plain = AdmissionRequest::new(handle(1).id());
+        let spaced = AdmissionRequest::new(handle(1).id())
+            .with_min_repeat_interval(Duration::from_millis(100));
+
+        let mut gate = AdmissionGate::new(&mut state, None, Duration::ZERO);
+        // An interval-less admission does not start the clock...
+        assert_eq!(admit(&mut gate, &plain), Ok(()));
+        // ...so a spaced request right after it is still admitted.
+        assert_eq!(admit(&mut gate, &spaced), Ok(()));
+
+        // The next frame is inside the interval; a later one is past it.
+        let mut gate = AdmissionGate::new(&mut state, None, Duration::from_millis(50));
+        assert_eq!(
+            admit(&mut gate, &spaced),
+            Err(AdmissionRejection::RepeatTooSoon)
+        );
+        let mut gate = AdmissionGate::new(&mut state, None, Duration::from_millis(150));
+        assert_eq!(admit(&mut gate, &spaced), Ok(()));
+    }
+
+    #[test]
+    fn gate_distance_culls_only_measurable_far_requests() {
+        let mut state = AdmissionState::<TestSound>::default();
+        let mut gate = AdmissionGate::new(&mut state, None, Duration::ZERO);
+        let request = AdmissionRequest::new(handle(1).id())
+            .at(Vec2::new(500.0, 0.0))
+            .with_max_distance(100.0);
+
+        assert_eq!(
+            gate.try_admit(&request, || 0, |position| Some(position.length())),
+            Err(AdmissionRejection::TooFar)
+        );
+        // No listener to measure against: never culled.
+        assert_eq!(gate.try_admit(&request, || 0, |_| None), Ok(()));
+        // A positionless request has nowhere to be measured from either.
+        let positionless = AdmissionRequest::new(handle(2).id()).with_max_distance(100.0);
+        assert_eq!(
+            gate.try_admit(&positionless, || 0, |_| Some(f32::INFINITY)),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn gate_queries_the_environment_only_for_set_controls() {
+        let mut state = AdmissionState::<TestSound>::default();
+        let mut gate = AdmissionGate::new(&mut state, None, Duration::ZERO);
+        let request = AdmissionRequest::new(handle(1).id());
+
+        let admitted = gate.try_admit(
+            &request,
+            || unreachable!("no max_concurrent set"),
+            |_| unreachable!("no max_distance set"),
+        );
+        assert_eq!(admitted, Ok(()));
+    }
+
+    #[test]
+    fn admission_request_mirrors_the_message_controls() {
+        let msg = PlayQueuedAudio::new(handle(1), TestSound::Sfx)
+            .at(Vec2::new(3.0, 4.0))
+            .with_max_concurrent(4)
+            .with_max_per_frame(2)
+            .with_min_repeat_interval(Duration::from_millis(40))
+            .with_max_distance(1200.0);
+        let request = msg.admission_request();
+
+        assert_eq!(request.sample, handle(1).id());
+        assert_eq!(request.position, Some(Vec2::new(3.0, 4.0)));
+        assert_eq!(request.max_concurrent, Some(4));
+        assert_eq!(request.max_per_frame, Some(2));
+        assert_eq!(request.min_repeat_interval, Some(Duration::from_millis(40)));
+        assert_eq!(request.max_distance, Some(1200.0));
+    }
+
+    // ==================== Displacement query ====================
+
+    #[test]
+    fn displacement_picks_the_weakest_beyond_the_margin() {
+        let candidates = [
+            DisplacementCandidate::new(eid(0), 1.0),
+            DisplacementCandidate::new(eid(1), 0.5),
+        ];
+
+        // Inside the margin over the weakest: no displacement.
+        assert_eq!(displacement_target(&candidates, &(), 0.6, 1.25), None);
+        // Beyond it: the weakest goes, not the loud one.
+        assert_eq!(
+            displacement_target(&candidates, &(), 0.7, 1.25),
+            Some(eid(1))
+        );
+    }
+
+    #[test]
+    fn displacement_of_nothing_is_none() {
+        let candidates: [DisplacementCandidate; 0] = [];
+        assert_eq!(displacement_target(&candidates, &(), 10.0, 1.0), None);
+    }
+
+    #[test]
+    fn displacement_tier_gate_beats_any_significance() {
+        #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+        enum Tier {
+            Low,
+            Normal,
+            Critical,
+        }
+
+        let candidates = [
+            DisplacementCandidate::new(eid(0), 100.0).with_tier(Tier::Low),
+            DisplacementCandidate::new(eid(1), 0.1).with_tier(Tier::Critical),
+        ];
+
+        // The weakest is the loud Low voice, not the quiet Critical one, and
+        // a higher-tier newcomer takes it however quiet the newcomer is.
+        assert_eq!(
+            displacement_target(&candidates, &Tier::Critical, 0.05, 1.25),
+            Some(eid(0))
+        );
+        assert_eq!(
+            displacement_target(&candidates, &Tier::Normal, 0.0, 1.25),
+            Some(eid(0))
+        );
+
+        // And a lower tier never displaces a higher one, however loud.
+        let critical_only = [DisplacementCandidate::new(eid(1), 0.1).with_tier(Tier::Critical)];
+        assert_eq!(
+            displacement_target(&critical_only, &Tier::Low, 1000.0, 1.0),
+            None
+        );
+    }
+
+    #[test]
+    fn displacement_same_tier_uses_the_margin() {
+        let candidates = [DisplacementCandidate::new(eid(0), 1.0).with_tier(1u8)];
+
+        assert_eq!(displacement_target(&candidates, &1u8, 1.2, 1.25), None);
+        assert_eq!(
+            displacement_target(&candidates, &1u8, 1.3, 1.25),
+            Some(eid(0))
+        );
+    }
+
+    #[test]
+    fn displacement_margin_is_sanitized() {
+        let candidates = [DisplacementCandidate::new(eid(0), 1.0)];
+
+        // Non-finite and sub-1.0 margins behave as 1.0...
+        assert_eq!(
+            displacement_target(&candidates, &(), 1.01, f32::NAN),
+            Some(eid(0))
+        );
+        assert_eq!(
+            displacement_target(&candidates, &(), 1.01, 0.0),
+            Some(eid(0))
+        );
+        // ...and equal significance never displaces, even at margin 1.0.
+        assert_eq!(displacement_target(&candidates, &(), 1.0, 1.0), None);
+    }
+
+    #[test]
+    fn displacement_weakest_ties_resolve_by_input_order() {
+        let candidates = [
+            DisplacementCandidate::new(eid(0), 0.5),
+            DisplacementCandidate::new(eid(1), 0.5),
+        ];
+        assert_eq!(
+            displacement_target(&candidates, &(), 1.0, 1.0),
+            Some(eid(0))
+        );
+    }
+
+    // ==================== Pool routing ====================
+
+    #[test]
+    fn default_routing_splits_spatial_and_non_spatial() {
+        let mut app = queue_app(VirtualVoiceBudget::new(2));
+        app.world_mut()
+            .write_message(PlayQueuedAudio::new(handle(1), TestSound::Sfx).looping());
+        app.world_mut().write_message(
+            PlayQueuedAudio::new(handle(2), TestSound::Sfx)
+                .looping()
+                .at(Vec2::new(1.0, 2.0)),
+        );
+        app.update_n(1);
+
+        let world = app.world_mut();
+        let mut promoted = 0;
+        let mut query = world.query_filtered::<(
+            &VirtualSound<TestSound>,
+            Has<DefaultPool>,
+            Has<SpatialPool>,
+        ), With<Audible>>();
+        for (sound, default_pool, spatial_pool) in query.iter(world) {
+            promoted += 1;
+            if sound.position().is_some() {
+                assert!(spatial_pool && !default_pool, "positioned voice");
+            } else {
+                assert!(default_pool && !spatial_pool, "positionless voice");
+            }
+        }
+        assert_eq!(promoted, 2);
+    }
+
+    #[test]
+    fn a_custom_pool_router_replaces_promotion_routing_and_release() {
+        #[derive(Component)]
+        struct CustomPool;
+
+        let mut app = physics_app();
+        app.add_plugins(
+            VirtualVoiceQueuePlugin::<TestSound>::new()
+                .with_budget(VirtualVoiceBudget::new(1).with_crossfade(Duration::ZERO))
+                .with_pool_router(QueuePoolRouter::new(
+                    |ec: &mut EntityCommands, _sound: &VirtualSound<TestSound>| {
+                        ec.insert(CustomPool);
+                    },
+                    |ec: &mut EntityCommands| {
+                        ec.remove::<CustomPool>();
+                    },
+                )),
+        );
+        app.world_mut().write_message(
+            PlayQueuedAudio::new(handle(1), TestSound::Sfx)
+                .looping()
+                .with_volume(0.5),
+        );
+        app.update_n(1);
+
+        let world = app.world_mut();
+        let voice = world
+            .query_filtered::<Entity, With<Audible>>()
+            .single(world)
+            .expect("promoted voice");
+        assert!(app.world().get::<CustomPool>(voice).is_some());
+        assert!(app.world().get::<DefaultPool>(voice).is_none());
+        assert!(app.world().get::<SpatialPool>(voice).is_none());
+
+        // Displace it; once the demotion fade completes, the release hook
+        // strips the custom label along with the rest of the voice.
+        app.world_mut()
+            .write_message(PlayQueuedAudio::new(handle(2), TestSound::Sfx).looping());
+        app.update_n(60);
+
+        assert!(
+            app.world().get_entity(voice).is_ok(),
+            "loop returns to virtual"
+        );
+        assert!(app.world().get::<Audible>(voice).is_none());
+        assert!(app.world().get::<CustomPool>(voice).is_none());
     }
 }
