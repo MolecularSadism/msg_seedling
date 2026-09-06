@@ -70,7 +70,7 @@
 //! sampler pools instead of adding [`VirtualVoiceQueuePlugin`]:
 //!
 //! - [`AdmissionGate`] runs the admission controls — the global per-frame
-//!   budget plus [`AdmissionRequest`]'s per-sample caps, repeat interval and
+//!   budget plus [`AdmissionRequest`]'s per-key caps, repeat interval and
 //!   distance cull — over the same [`AdmissionState`] resource the plugin
 //!   uses. The plugin's own enqueue system is built on it, so a host gating
 //!   its own request stream gets identical semantics.
@@ -136,6 +136,7 @@
 //! ```
 
 use core::cmp::Ordering;
+use core::hash::Hash;
 use core::time::Duration;
 use std::sync::Arc;
 
@@ -467,7 +468,7 @@ impl<C: AudioCategory> PlayQueuedAudio<C> {
     #[must_use]
     pub fn admission_request(&self) -> AdmissionRequest {
         AdmissionRequest {
-            sample: self.handle.id(),
+            key: self.handle.id(),
             position: self.position.map(|position| position.as_vec3().truncate()),
             max_concurrent: self.max_concurrent,
             max_per_frame: self.max_per_frame,
@@ -660,27 +661,26 @@ impl<C: AudioCategory> Plugin for VirtualVoiceQueuePlugin<C> {
     }
 }
 
-/// Per-category admission bookkeeping: when each sample was last admitted,
-/// for [`PlayQueuedAudio::min_repeat_interval`].
+/// Per-key admission bookkeeping: when each key was last admitted, for
+/// [`AdmissionRequest::min_repeat_interval`].
 ///
-/// [`VirtualVoiceQueuePlugin`] initializes it; a bring-your-own-pool host
-/// gating its own request stream through [`AdmissionGate`] initializes it
-/// itself (`app.init_resource::<AdmissionState<C>>()`).
+/// `M` is a marker for [`Resource`] discrimination (e.g. one per audio
+/// category); `K` is the key type per-key controls track on. Both default
+/// for the built-in queue; a bring-your-own-pool host picks the types that
+/// match its request shape.
 ///
 /// Bounded however many distinct samples stream through a session: only
 /// admissions that carry an interval are recorded, and once the map grows
 /// past a threshold, entries older than the longest interval seen — too old
 /// to ever block a request again — are pruned before recording more.
 #[derive(Resource)]
-pub struct AdmissionState<C: AudioCategory> {
-    last_admitted: bevy::platform::collections::HashMap<AssetId<AudioSample>, Duration>,
-    /// The longest interval any recorded admission carried; the prune
-    /// horizon.
+pub struct AdmissionState<M = (), K = AssetId<AudioSample>> {
+    last_admitted: bevy::platform::collections::HashMap<K, Duration>,
     longest_interval: Duration,
-    _phantom: core::marker::PhantomData<C>,
+    _phantom: core::marker::PhantomData<M>,
 }
 
-impl<C: AudioCategory> Default for AdmissionState<C> {
+impl<M, K> Default for AdmissionState<M, K> {
     fn default() -> Self {
         Self {
             last_admitted: Default::default(),
@@ -690,13 +690,10 @@ impl<C: AudioCategory> Default for AdmissionState<C> {
     }
 }
 
-impl<C: AudioCategory> AdmissionState<C> {
-    /// Recorded admissions beyond this many trigger a prune of entries past
-    /// the horizon before the next is recorded.
+impl<M, K: Eq + Hash + Clone> AdmissionState<M, K> {
     const PRUNE_THRESHOLD: usize = 64;
 
-    /// Records an admission of `id` at `now` under `interval`.
-    fn record(&mut self, id: AssetId<AudioSample>, now: Duration, interval: Duration) {
+    fn record(&mut self, id: K, now: Duration, interval: Duration) {
         self.longest_interval = self.longest_interval.max(interval);
         if self.last_admitted.len() >= Self::PRUNE_THRESHOLD
             && !self.last_admitted.contains_key(&id)
@@ -715,22 +712,27 @@ impl<C: AudioCategory> AdmissionState<C> {
 /// request using none of them is always admitted (up to the gate's global
 /// frame budget).
 ///
+/// `K` is the key type that per-key controls (per-frame cap, concurrency,
+/// repeat interval) track on — [`AssetId<AudioSample>`] for the built-in
+/// queue, but any `Hash + Eq + Clone` type for a bring-your-own-pool host.
+///
 /// [`PlayQueuedAudio::admission_request`] produces one from a queue request;
 /// each field mirrors the [`PlayQueuedAudio`] field of the same name.
 #[derive(Clone, Debug)]
-pub struct AdmissionRequest {
-    /// The sample being requested; the per-sample controls key on its id.
-    pub sample: AssetId<AudioSample>,
+pub struct AdmissionRequest<K = AssetId<AudioSample>> {
+    /// The key identifying the sound being requested; per-key controls
+    /// track on this.
+    pub key: K,
     /// XY world position, measured against listeners for
     /// [`Self::max_distance`]. `None` is never distance-culled.
     pub position: Option<Vec2>,
-    /// Cap on live entries playing this same sample; see
+    /// Cap on live entries playing this same key; see
     /// [`PlayQueuedAudio::max_concurrent`].
     pub max_concurrent: Option<usize>,
-    /// Cap on admissions of this same sample within one frame; see
+    /// Cap on admissions of this same key within one frame; see
     /// [`PlayQueuedAudio::max_per_frame`].
     pub max_per_frame: Option<usize>,
-    /// Minimum time since this same sample was last admitted *with an
+    /// Minimum time since this same key was last admitted *with an
     /// interval*; see [`PlayQueuedAudio::min_repeat_interval`].
     pub min_repeat_interval: Option<Duration>,
     /// Maximum distance from the nearest listener worth admitting at; see
@@ -738,12 +740,12 @@ pub struct AdmissionRequest {
     pub max_distance: Option<f32>,
 }
 
-impl AdmissionRequest {
-    /// Creates a request for `sample` with every control off.
+impl<K> AdmissionRequest<K> {
+    /// Creates a request for `key` with every control off.
     #[must_use]
-    pub fn new(sample: AssetId<AudioSample>) -> Self {
+    pub fn new(key: K) -> Self {
         Self {
-            sample,
+            key,
             position: None,
             max_concurrent: None,
             max_per_frame: None,
@@ -759,21 +761,21 @@ impl AdmissionRequest {
         self
     }
 
-    /// Caps live entries playing this same sample.
+    /// Caps live entries playing this same key.
     #[must_use]
     pub fn with_max_concurrent(mut self, max_concurrent: usize) -> Self {
         self.max_concurrent = Some(max_concurrent);
         self
     }
 
-    /// Caps admissions of this same sample within one frame.
+    /// Caps admissions of this same key within one frame.
     #[must_use]
     pub fn with_max_per_frame(mut self, max_per_frame: usize) -> Self {
         self.max_per_frame = Some(max_per_frame);
         self
     }
 
-    /// Sets the minimum time since this same sample was last admitted.
+    /// Sets the minimum time since this same key was last admitted.
     #[must_use]
     pub fn with_min_repeat_interval(mut self, interval: Duration) -> Self {
         self.min_repeat_interval = Some(interval);
@@ -796,13 +798,13 @@ pub enum AdmissionRejection {
     /// The gate's global per-frame budget is spent
     /// ([`VirtualVoiceBudget::max_admissions_per_frame`]).
     FrameBudgetSpent,
-    /// This sample already hit its [`AdmissionRequest::max_per_frame`] this
+    /// This key already hit its [`AdmissionRequest::max_per_frame`] this
     /// frame.
     PerFrameCap,
-    /// This sample already has [`AdmissionRequest::max_concurrent`] live
+    /// This key already has [`AdmissionRequest::max_concurrent`] live
     /// entries (same-frame admissions included).
     ConcurrentCap,
-    /// This sample was last admitted less than
+    /// This key was last admitted less than
     /// [`AdmissionRequest::min_repeat_interval`] ago.
     RepeatTooSoon,
     /// The request's position is farther than
@@ -813,28 +815,28 @@ pub enum AdmissionRejection {
 /// One frame's admission gate: the significance queue's admission controls,
 /// pool-agnostic, for hosts gating their own request stream.
 ///
-/// Create one per frame over the category's [`AdmissionState`] and feed it
+/// Create one per frame over the matching [`AdmissionState`] and feed it
 /// each request in arrival order; [`Self::try_admit`] answers per request
 /// and does the bookkeeping (frame counters, repeat-interval recording) for
 /// the ones that pass. [`VirtualVoiceQueuePlugin`]'s own enqueue system is
 /// implemented on this same gate, so a host running it against its own
 /// requests gets identical semantics, control for control.
-pub struct AdmissionGate<'a, C: AudioCategory> {
-    state: &'a mut AdmissionState<C>,
+pub struct AdmissionGate<'a, M = (), K: Eq + Hash + Clone = AssetId<AudioSample>> {
+    state: &'a mut AdmissionState<M, K>,
     frame_budget: Option<usize>,
     now: Duration,
     admitted: usize,
-    admitted_per_sample: bevy::platform::collections::HashMap<AssetId<AudioSample>, usize>,
+    admitted_per_key: bevy::platform::collections::HashMap<K, usize>,
 }
 
-impl<'a, C: AudioCategory> AdmissionGate<'a, C> {
+impl<'a, M, K: Eq + Hash + Clone> AdmissionGate<'a, M, K> {
     /// Opens the gate for one frame. `frame_budget` caps admissions across
     /// every sound this frame (the queue passes
     /// [`VirtualVoiceBudget::max_admissions_per_frame`]; `None` admits
     /// everything); `now` is the current [`Time::elapsed`].
     #[must_use]
     pub fn new(
-        state: &'a mut AdmissionState<C>,
+        state: &'a mut AdmissionState<M, K>,
         frame_budget: Option<usize>,
         now: Duration,
     ) -> Self {
@@ -843,7 +845,7 @@ impl<'a, C: AudioCategory> AdmissionGate<'a, C> {
             frame_budget,
             now,
             admitted: 0,
-            admitted_per_sample: Default::default(),
+            admitted_per_key: Default::default(),
         }
     }
 
@@ -858,7 +860,7 @@ impl<'a, C: AudioCategory> AdmissionGate<'a, C> {
     ///
     /// The environment comes in as closures so it is only computed for
     /// requests that actually set the control needing it: `live_count`
-    /// counts the live entries already playing the request's sample from
+    /// counts the live entries already playing the request's key from
     /// *before* this frame's admissions — the gate adds this frame's own —
     /// where "live" for the queue means virtual or audible, retiring
     /// excluded; `nearest_listener_distance` is the distance from the given
@@ -867,7 +869,7 @@ impl<'a, C: AudioCategory> AdmissionGate<'a, C> {
     /// to `SpatialListener2D`s; a host measures however its geometry works.
     pub fn try_admit(
         &mut self,
-        request: &AdmissionRequest,
+        request: &AdmissionRequest<K>,
         live_count: impl FnOnce() -> usize,
         nearest_listener_distance: impl FnOnce(Vec2) -> Option<f32>,
     ) -> Result<(), AdmissionRejection> {
@@ -878,8 +880,8 @@ impl<'a, C: AudioCategory> AdmissionGate<'a, C> {
         }
 
         let same_this_frame = self
-            .admitted_per_sample
-            .get(&request.sample)
+            .admitted_per_key
+            .get(&request.key)
             .copied()
             .unwrap_or(0);
         if let Some(cap) = request.max_per_frame
@@ -893,7 +895,7 @@ impl<'a, C: AudioCategory> AdmissionGate<'a, C> {
             return Err(AdmissionRejection::ConcurrentCap);
         }
         if let Some(interval) = request.min_repeat_interval
-            && let Some(&last) = self.state.last_admitted.get(&request.sample)
+            && let Some(&last) = self.state.last_admitted.get(&request.key)
             && self.now.saturating_sub(last) < interval
         {
             return Err(AdmissionRejection::RepeatTooSoon);
@@ -906,9 +908,13 @@ impl<'a, C: AudioCategory> AdmissionGate<'a, C> {
         }
 
         self.admitted += 1;
-        *self.admitted_per_sample.entry(request.sample).or_insert(0) += 1;
+        *self
+            .admitted_per_key
+            .entry(request.key.clone())
+            .or_insert(0) += 1;
         if let Some(interval) = request.min_repeat_interval {
-            self.state.record(request.sample, self.now, interval);
+            self.state
+                .record(request.key.clone(), self.now, interval);
         }
         Ok(())
     }
@@ -935,7 +941,7 @@ fn enqueue_queued_audio<C: AudioCategory>(
             || {
                 existing
                     .iter()
-                    .filter(|sound| sound.handle.id() == request.sample)
+                    .filter(|sound| sound.handle.id() == request.key)
                     .count()
             },
             |position| {
@@ -2526,7 +2532,7 @@ mod tests {
     }
 
     #[test]
-    fn gate_per_frame_cap_is_per_sample() {
+    fn gate_per_frame_cap_is_per_key() {
         let mut state = AdmissionState::<TestSound>::default();
         let mut gate = AdmissionGate::new(&mut state, None, Duration::ZERO);
         let capped = AdmissionRequest::new(handle(1).id()).with_max_per_frame(1);
@@ -2630,7 +2636,7 @@ mod tests {
             .with_max_distance(1200.0);
         let request = msg.admission_request();
 
-        assert_eq!(request.sample, handle(1).id());
+        assert_eq!(request.key, handle(1).id());
         assert_eq!(request.position, Some(Vec2::new(3.0, 4.0)));
         assert_eq!(request.max_concurrent, Some(4));
         assert_eq!(request.max_per_frame, Some(2));
