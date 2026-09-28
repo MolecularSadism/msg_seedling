@@ -20,6 +20,7 @@
 //! | [`mix_fade`] | [`MixFadePlugin<Conf>`](mix_fade::MixFadePlugin) | fading the whole main bus at once |
 //! | [`fade`] | [`fade::plugin`] | `FadeInAudio`/`FadeOutAudio` for any sample entity |
 //! | [`device_follow`] | [`device_follow::plugin`] | keeps the stream on the OS default output device (native only) |
+//! | [`null_backend`] | `SeedlingPlugin::<`[`NullBackend`]`>` | runs the whole graph with no device and meters what it renders (native only) |
 //!
 //! ## The volume model
 //!
@@ -173,6 +174,8 @@ pub mod fade;
 mod handlers;
 mod messages;
 pub mod mix_fade;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod null_backend;
 mod randomization;
 #[cfg(test)]
 mod tests;
@@ -192,6 +195,8 @@ pub use ducking::{DuckingEnvelope, Ducks, tick_ducking_envelope};
 pub use fade::{FadeInAudio, FadeOutAudio, FadeSystems};
 pub use messages::{FadeAudio, PlayAudio, SpatialPosition, StopAudio};
 pub use mix_fade::{FadeMix, MixFadePlugin, MixFadeState, MixLevel, fade_target};
+#[cfg(not(target_arch = "wasm32"))]
+pub use null_backend::{NullBackend, NullBackendConfig, NullOutputMeter};
 pub use randomization::{DefaultRandomization, Randomization};
 pub use traits::{AudioCategory, AudioConfig};
 pub use virtual_queue::{

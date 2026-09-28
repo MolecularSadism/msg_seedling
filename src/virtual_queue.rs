@@ -913,8 +913,7 @@ impl<'a, M, K: Eq + Hash + Clone> AdmissionGate<'a, M, K> {
             .entry(request.key.clone())
             .or_insert(0) += 1;
         if let Some(interval) = request.min_repeat_interval {
-            self.state
-                .record(request.key.clone(), self.now, interval);
+            self.state.record(request.key.clone(), self.now, interval);
         }
         Ok(())
     }

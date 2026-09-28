@@ -111,6 +111,7 @@ composes with it -- add what your game actually uses:
 | `msg_seedling::ducking::plugin` | the whole app | the ducking envelope alone, if you write your own volume nodes |
 | `msg_seedling::fade::plugin` | the whole app | `FadeInAudio`/`FadeOutAudio` alone (already pulled in by the two above) |
 | `msg_seedling::device_follow::plugin` | the whole app (native) | [following the OS default output device](#following-the-os-default-output-device) |
+| `SeedlingPlugin::<NullBackend>` | the whole app (native, replaces the default backend) | [running audio without a device](#running-audio-without-a-device) |
 
 ### 4. Play audio
 
@@ -243,6 +244,31 @@ commands.insert_resource(FollowDefaultAudioDevice {
     poll_interval: Duration::from_millis(500),
 });
 ```
+
+## Running Audio Without a Device
+
+`NullBackend` is a Firewheel backend with nothing behind it. It renders the
+whole graph on its own thread at the stream's real-time rate and discards each
+block instead of sending it to the OS, so samplers, buses, filters and fades
+all run while nobody hears anything. Use it for tests, bots, headless runs and
+machines with no sound card.
+
+Each discarded block is summarized into a `NullOutputMeter` — blocks and frames
+rendered, the peak absolute sample, and a count of NaN/infinite samples — so a
+test can assert that sound came out and that it was well-formed. Clones share
+the same counters: keep one as a resource, hand the other to the stream config.
+
+```rust
+let meter = NullOutputMeter::default();
+app.insert_resource(meter.clone());
+app.add_plugins(SeedlingPlugin::<NullBackend> {
+    stream_config: NullBackendConfig { meter, ..default() },
+    ..SeedlingPlugin::<NullBackend>::new()
+});
+```
+
+`device_follow::plugin` is inert under this backend: it only acts on the
+`cpal` stream config. Native only.
 
 ## Sound Damping Fields
 
