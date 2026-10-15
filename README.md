@@ -520,7 +520,9 @@ fn explode(mut writer: MessageWriter<PlayQueuedAudio<Sound>>, boom: Handle<Audio
   config-driven volume rewrites reach it like any other sound. A fresh sound
   and every one-shot start at full level (a fade-in would blunt the attack); a
   loop coming back after waiting fades in. `VirtualSound::silent_start()`
-  leaves the start to the host's own fade or per-frame volume write.
+  leaves the start to the host's own fade or per-frame volume write, and
+  `VirtualSound::fixed_pitch()` leaves out the `BasePitch`, so damping never
+  bends the voice's speed (music, or a speed the host drives itself).
 - **Demotion.** A loop fades out, sheds its voice and waits again (playback
   restarts from the beginning when it returns); a one-shot despawns after its
   fade.

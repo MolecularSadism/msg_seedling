@@ -81,6 +81,8 @@
 //!   A loop that comes back after waiting fades in over the crossfade.
 //!   [`VirtualSound::silent_start`] leaves the start to the host: the voice
 //!   starts silent and the host's own fade or per-frame write brings it up.
+//!   [`VirtualSound::fixed_pitch`] leaves out the [`BasePitch`], so damping
+//!   never bends that voice's speed.
 //! - **Demotion.** Looping entries fade out, shed their `SamplePlayer`, and
 //!   return to the silent virtual state, eligible for re-promotion; playback
 //!   restarts from the beginning when re-promoted. One-shot entries despawn
@@ -346,6 +348,7 @@ pub struct VirtualSound<C: AudioCategory> {
     max_audible: Option<usize>,
     max_distance: Option<f32>,
     silent_start: bool,
+    fixed_pitch: bool,
     max_concurrent: Option<usize>,
     max_per_frame: Option<usize>,
     min_repeat_interval: Option<Duration>,
@@ -383,6 +386,7 @@ impl<C: AudioCategory> VirtualSound<C> {
             max_audible: None,
             max_distance: None,
             silent_start: false,
+            fixed_pitch: false,
             max_concurrent: None,
             max_per_frame: None,
             min_repeat_interval: None,
@@ -470,6 +474,16 @@ impl<C: AudioCategory> VirtualSound<C> {
     #[must_use]
     pub fn silent_start(mut self) -> Self {
         self.silent_start = true;
+        self
+    }
+
+    /// Keeps the voice at its own pitch: it is promoted without a
+    /// [`BasePitch`], so no [`SoundDampingField`] bends its speed. For sounds
+    /// whose pitch is a musical fact rather than an acoustic one, and for
+    /// voices whose speed a host system drives itself.
+    #[must_use]
+    pub fn fixed_pitch(mut self) -> Self {
+        self.fixed_pitch = true;
         self
     }
 
@@ -1655,7 +1669,8 @@ fn rank_virtual_voices<C: AudioCategory>(
 /// again. The bare `C` component rides along so per-sound category systems
 /// (damping, ducking, the config-driven volume rewrites) see the voice, and
 /// [`BaseVolume`]/[`BasePitch`] ride along with it so those systems recompute
-/// the entry's *own* level and pitch rather than flattening them;
+/// the entry's *own* level and pitch rather than flattening them — the pitch
+/// baseline only unless the entry is [`VirtualSound::fixed_pitch`];
 /// [`release_voice`] strips all three with the rest of the promotion.
 fn promote<C: AudioCategory>(
     commands: &mut Commands,
@@ -1678,11 +1693,13 @@ fn promote<C: AudioCategory>(
     };
 
     let mut ec = commands.entity(entity);
+    if !sound.fixed_pitch {
+        ec.insert(BasePitch(sound.pitch));
+    }
     ec.insert((
         player,
         sound.category,
         BaseVolume(sound.base_volume),
-        BasePitch(sound.pitch),
         // `OnComplete::Remove` keeps the entity when seedling ends the voice
         // (steal, queue expiry, one-shot completion) so `reclaim_lost_voices`
         // can apply the queue's own policy.
@@ -2291,6 +2308,21 @@ mod tests {
         assert!((settings.speed - f64::from(1.3_f32)).abs() < 1e-9);
         assert_eq!(world.get::<BasePitch>(voice), Some(&BasePitch(1.3)));
         assert!(world.get::<Name>(voice).is_some());
+    }
+
+    #[test]
+    fn a_fixed_pitch_voice_carries_no_pitch_baseline_for_damping_to_bend() {
+        let mut app = queue_app(1, VirtualVoiceBudget::new());
+        play(&mut app, sound(1).looping().with_pitch(1.5).fixed_pitch());
+        app.update_n(1);
+
+        let voice = the_voice(&mut app);
+        assert!(app.world().get::<BasePitch>(voice).is_none());
+        let speed = app.world().get::<PlaybackSettings>(voice).unwrap().speed;
+        assert!(
+            (speed - 1.5).abs() < 1e-6,
+            "it still plays at its own pitch"
+        );
     }
 
     #[test]
