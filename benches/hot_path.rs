@@ -1,16 +1,21 @@
-//! Micro-benchmarks for the per-frame damping and ducking math.
+//! Micro-benchmarks for the per-frame damping, ducking and voice-ranking math.
 //!
 //! Every input is fixed — no RNG, no wall-clock dependence — so numbers are
 //! comparable across runs and commits. These cover the pure functions the
-//! apply systems call per sound per frame: field influence, multi-field
-//! resolution (including the geometric cutoff/speed interpolation), and the
-//! ducking envelope tick.
+//! per-frame systems call: field influence, multi-field resolution (including
+//! the geometric cutoff/speed interpolation), the ducking envelope tick, the
+//! game-side distance model, and the virtual queue's whole-set ranking.
 
 use std::hint::black_box;
 
 use bevy::math::Vec2;
+use bevy::prelude::Entity;
+use bevy_seedling::prelude::SpatialBasicNode;
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
-use msg_seedling::{ActiveField, DuckingEnvelope, SoundDamping, SoundDampingField};
+use msg_seedling::attenuation::spatial_gain;
+use msg_seedling::{
+    ActiveField, DuckingEnvelope, SoundDamping, SoundDampingField, VoiceCandidate, rank_voices,
+};
 
 /// A deterministic spread of fields: centres marching along the x axis, each
 /// with a distinct authored volume, cutoff, and speed so every axis of the
@@ -131,6 +136,53 @@ fn bench_duck_tick(c: &mut Criterion) {
     group.finish();
 }
 
+/// The distance model at a point past the reference distance, where the
+/// inverse curve does its division — evaluated per spatial entry per frame.
+fn bench_spatial_gain(c: &mut Criterion) {
+    let node = SpatialBasicNode::default();
+    c.bench_function("spatial_gain/inverse", |b| {
+        b.iter(|| spatial_gain(black_box(&node), black_box(37.5)));
+    });
+}
+
+/// A deterministic swarm: three lanes, a dozen samples each capped at five
+/// voices, a quarter of the entries already audible, significances spread so
+/// the sort does real work.
+fn make_candidates(count: usize) -> Vec<VoiceCandidate<u32>> {
+    (0..count)
+        .map(|i| {
+            let id = u32::try_from(i).expect("bench sizes fit in u32");
+            VoiceCandidate {
+                entity: Entity::from_raw_u32(id).expect("valid index"),
+                lane: i % 3,
+                key: id % 12,
+                tier: i32::from(i % 7 == 0),
+                significance: ((i * 7919) % 1000) as f32 / 1000.0,
+                audible: i % 4 == 0,
+                eligible: i % 13 != 0,
+                max_audible: Some(5),
+                sequence: u64::from(id),
+            }
+        })
+        .collect()
+}
+
+fn bench_rank_voices(c: &mut Criterion) {
+    let capacity = [48, 24, 8];
+    let mut group = c.benchmark_group("rank_voices");
+    for count in [64usize, 256, 1024] {
+        let candidates = make_candidates(count);
+        group.bench_with_input(
+            BenchmarkId::from_parameter(count),
+            &candidates,
+            |b, candidates| {
+                b.iter(|| rank_voices(black_box(candidates), black_box(&capacity)));
+            },
+        );
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_influence,
@@ -138,5 +190,7 @@ criterion_group!(
     bench_resolve_positionless,
     bench_geometric_axes,
     bench_duck_tick,
+    bench_spatial_gain,
+    bench_rank_voices,
 );
 criterion_main!(benches);

@@ -16,7 +16,8 @@
 //! |--------|--------|--------------|
 //! | [`damping`] | [`DampingPlugin<C>`](damping::DampingPlugin) | world-space fields that muffle the sound crossing them, on volume, cutoff and pitch |
 //! | [`ducking`] | shared with [`damping`], or [`ducking::plugin`] | one mix-wide sidechain envelope so a crucial cue lands |
-//! | [`virtual_queue`] | [`VirtualVoiceQueuePlugin<C>`](virtual_queue::VirtualVoiceQueuePlugin) | a significance-ranked voice budget that crossfades instead of hard-cutting |
+//! | [`virtual_queue`] | [`VirtualVoiceQueuePlugin<C>`](virtual_queue::VirtualVoiceQueuePlugin) | voices ranked by how loud each sound reaches the listener, per pool and per sample, crossfading instead of hard-cutting |
+//! | [`attenuation`] | — | the spatial distance model evaluated game-side, for ranking |
 //! | [`mix_fade`] | [`MixFadePlugin<Conf>`](mix_fade::MixFadePlugin) | fading the whole main bus at once |
 //! | [`fade`] | [`fade::plugin`] | `FadeInAudio`/`FadeOutAudio` for any sample entity |
 //! | [`device_follow`] | [`device_follow::plugin`] | keeps the stream on the OS default output device (native only) |
@@ -29,6 +30,13 @@
 //! sound's volume node recomputes that whole product rather than overwriting
 //! it. [`baseline`] is where the per-sound halves of it live, and why the
 //! layers compose instead of racing.
+//!
+//! Every factor is a *level* on firewheel's `Volume::Linear` fader scale, not
+//! an amplitude: firewheel applies a level `v` as the amplitude `v²`, so `0.5`
+//! sits 12 dB below unity. Levels multiply into a level, and the product maps
+//! to amplitude once, on the audio thread. Anything that needs the amplitude
+//! itself — ranking voices by loudness, a dB figure — goes through
+//! `Volume::amp`.
 //!
 //! ## Quick Start
 //!
@@ -164,6 +172,7 @@
 //! types explicitly wherever `bevy::prelude` would export the same name — and
 //! [`BevyAudioGuardPlugin`] warns at startup when `AudioPlugin` is live anyway.
 
+pub mod attenuation;
 pub mod baseline;
 pub mod bevy_audio_guard;
 pub mod damping;
@@ -201,9 +210,10 @@ pub use randomization::{DefaultRandomization, Randomization};
 pub use traits::{AudioCategory, AudioConfig};
 pub use virtual_queue::{
     AdmissionGate, AdmissionRejection, AdmissionRequest, AdmissionState, Audible,
-    DEFAULT_DISPLACEMENT_MARGIN, DisplacementCandidate, PlayQueuedAudio, QueuePoolRouter, Retiring,
-    SignificanceEntry, StopQueuedAudio, VirtualSound, VirtualVoiceBudget, VirtualVoiceQueuePlugin,
-    VoiceDecision, displacement_target, rank_by_significance,
+    DEFAULT_DISPLACEMENT_MARGIN, DisplacementCandidate, PlayQueuedAudio, QueueLane,
+    QueuePoolRouter, Retiring, StopQueuedAudio, VirtualQueueSystems, VirtualSound,
+    VirtualVoiceBudget, VirtualVoiceQueuePlugin, VoiceCandidate, VoiceDecision,
+    displacement_target, rank_voices,
 };
 
 use bevy::prelude::*;
@@ -373,8 +383,8 @@ pub mod prelude {
     pub use crate::randomization::{DefaultRandomization, Randomization};
     pub use crate::traits::{AudioCategory, AudioConfig};
     pub use crate::virtual_queue::{
-        Audible, PlayQueuedAudio, Retiring, StopQueuedAudio, VirtualSound, VirtualVoiceBudget,
-        VirtualVoiceQueuePlugin,
+        Audible, PlayQueuedAudio, QueueLane, QueuePoolRouter, Retiring, StopQueuedAudio,
+        VirtualQueueSystems, VirtualSound, VirtualVoiceBudget, VirtualVoiceQueuePlugin,
     };
 
     // Re-export commonly needed seedling types

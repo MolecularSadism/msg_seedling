@@ -12,7 +12,7 @@ use core::time::Duration;
 use bevy::prelude::*;
 use bevy_seedling::prelude::*;
 
-use crate::baseline::BaseVolume;
+use crate::baseline::{BaseVolume, sanitize_weight};
 
 /// How long past its duration an untriggered fade-out waits for its
 /// `SampleEffects` to resolve before completing without a ramp.
@@ -31,17 +31,21 @@ const UNRESOLVED_EFFECTS_GRACE: Duration = Duration::from_millis(500);
 pub struct FadeInAudio {
     /// Duration of the fade.
     pub duration: Duration,
-    /// Target linear volume (0.0–1.0) to fade to.
+    /// Target linear volume to fade to.
     pub target_volume: f32,
 }
 
 impl FadeInAudio {
     /// Creates a fade-in to `target_volume` over `duration`.
+    ///
+    /// The target is sanitized like every weight — non-finite becomes `0.0`,
+    /// negative clamps to `0.0` — but not capped at unity: a sound's own trim
+    /// may lift it above `1.0`, and a fade must land where the sound belongs.
     #[must_use]
     pub fn new(duration: Duration, target_volume: f32) -> Self {
         Self {
             duration,
-            target_volume: target_volume.clamp(0.0, 1.0),
+            target_volume: sanitize_weight(target_volume),
         }
     }
 }
@@ -245,12 +249,14 @@ mod tests {
     }
 
     #[test]
-    fn fade_in_clamps_target_volume() {
+    fn fade_in_keeps_an_amplifying_target_and_sanitizes_hostile_ones() {
         let fade = FadeInAudio::new(Duration::from_millis(100), 1.5);
-        assert!((fade.target_volume - 1.0).abs() < f32::EPSILON);
+        assert!((fade.target_volume - 1.5).abs() < f32::EPSILON);
 
-        let fade = FadeInAudio::new(Duration::from_millis(100), -0.5);
-        assert!((fade.target_volume - 0.0).abs() < f32::EPSILON);
+        for hostile in [-0.5, f32::NAN, f32::INFINITY] {
+            let fade = FadeInAudio::new(Duration::from_millis(100), hostile);
+            assert_eq!(fade.target_volume, 0.0, "{hostile}");
+        }
     }
 
     #[test]

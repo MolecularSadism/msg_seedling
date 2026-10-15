@@ -73,7 +73,7 @@ const MIN_SHAPE_SECS: f32 = 1e-4;
 ///
 /// `1.0` at rest; pulled toward [`Self::ducked_gain`] while a cue holds it.
 /// The shape parameters are public so a host can tune the sidechain; the
-/// defaults are a felt-but-safe −6 dB dip with a fast attack and slow
+/// defaults are a felt-but-safe −12 dB dip with a fast attack and slow
 /// release. Because they are freely writable, the shape fields are
 /// sanitized where they are read ([`Self::trigger`] and [`Self::tick`])
 /// rather than at assignment: no configuration can push the gain outside
@@ -81,14 +81,15 @@ const MIN_SHAPE_SECS: f32 = 1e-4;
 #[derive(Resource, Reflect, Debug, Clone, Copy, PartialEq)]
 #[reflect(Resource)]
 pub struct DuckingEnvelope {
-    /// Current linear gain applied to duckable sounds.
+    /// Current level (see the [volume model](crate#the-volume-model)) applied
+    /// to duckable sounds.
     gain: f32,
     /// Seconds of full-depth hold left before the release begins.
     hold_remaining: f32,
-    /// Linear gain the routine mix is pulled down to while a cue plays.
-    /// Read clamped to `0.0..=1.0`.
+    /// Level the routine mix is pulled down to while a cue plays. Read
+    /// clamped to `0.0..=1.0`.
     ///
-    /// The default −6 dB (`0.5`): clearly felt, nowhere near a dropout.
+    /// The default `0.5` is −12 dB: clearly felt, nowhere near a dropout.
     pub ducked_gain: f32,
     /// Seconds to reach [`Self::ducked_gain`] once triggered. Fast, so the
     /// cue's transient is already standing clear of the bed. Read floored
@@ -132,7 +133,7 @@ impl DuckingEnvelope {
         self.hold_remaining <= 0.0 && self.gain >= 1.0
     }
 
-    /// The envelope's current linear gain, e.g. for display in a mixer panel.
+    /// The envelope's current level, e.g. for display in a mixer panel.
     #[must_use]
     pub fn gain(&self) -> f32 {
         self.gain
