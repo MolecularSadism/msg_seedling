@@ -11,7 +11,7 @@ Built on the [Firewheel](https://github.com/BillyDM/Firewheel) audio engine via 
 - **Smooth fading** -- audio-thread ramps for glitch-free fade-outs, reusable `FadeInAudio`/`FadeOutAudio` components for any sample entity, and `FadeMix` for taking the whole bus down at once
 - **Sound damping fields** -- world-space volumes that muffle what crosses them, on volume, low-pass cutoff and pitch at once (authorable in data behind the `serde` feature)
 - **Sidechain ducking** -- one mix-wide envelope that steps the routine mix back so a crucial cue lands
-- **Virtual voice queue** -- opt-in, significance-ranked voice budget that crossfades between sounds instead of hard-cutting when a pool runs out of room; displaced loops wait silently and come back, and admission controls drop the requests not worth queueing
+- **Virtual voice queue** -- opt-in voice allocation ranked by how loud each sound actually reaches the listener (distance and damping included), with per-pool and per-sample budgets and hard priority tiers; it crossfades instead of hard-cutting, displaced loops wait silently and come back, and admission controls drop the one-shots not worth queueing
 
 ## Quick Start
 
@@ -22,7 +22,7 @@ the `2d`, `3d` and `ui` feature groups, and nothing here plays through it.
 
 ```toml
 [dependencies]
-msg_seedling = "0.4"
+msg_seedling = "0.6"
 bevy_seedling = "0.7"
 bevy = { version = "0.18", default-features = false, features = [
     "2d_bevy_render", "default_app", "picking", "scene",
@@ -434,178 +434,186 @@ rather than a true zero. Inaudible on any real mix, but not literally silent.
 ## Virtual Voice Queue
 
 `PlayAudio` hands a request straight to seedling's pool system. If the pool is
-already at its configured size, seedling steals whichever voice loses its
-internal priority tie-break -- instantly, with no fade. Two sounds trading
-places this way is audible as a hard cut, not a transition.
+already at its configured size, seedling steals by `SamplePriority` and then by
+playback age -- instantly, with no fade, and with no idea which sound is the
+one the player actually hears. Two sounds trading places this way is audible
+as a hard cut, and a swarm of identical emitters stacks every copy into the mix.
 
-`VirtualVoiceQueuePlugin<C>` is an opt-in alternative for category `C`: every
-`PlayQueuedAudio` request becomes a *virtual* entry ranked by **audible
-significance** (its resolved volume, times an optional priority weight), and
-only the top `VirtualVoiceBudget::max_audible` entries ever get a real
-`SamplePlayer`. When ranking changes, entries cross the line via
-`FadeInAudio`/`FadeOutAudio` instead of a hard cut -- promoting one voice
-while demoting another reads as an actual crossfade. Significance tracks the
-category volume from your config resource live, so a settings change
-re-ranks waiting and audible entries on the next frame.
+`VirtualVoiceQueuePlugin<C>` puts a ranking layer in front of the pools for
+category `C`. Every sound becomes a *virtual* entry ranked by **audible
+significance** -- the amplitude it would reach the listener with:
 
-Entries that don't make the cut aren't rejected outright: they wait as
-silent virtual entries and get promoted the moment a slot frees up or they
-become the most significant thing requested. Looping entries wait
-indefinitely; one-shots give up after `VirtualVoiceBudget::max_wait`.
-Demotion follows the same split: a demoted **looping** entry fades out,
-drops its `SamplePlayer`, and returns to the silent virtual state, eligible
-for re-promotion (playback restarts from the beginning); a demoted
-**one-shot** despawns after its fade, since a partially-played one-shot
-restarting later would be wrong. Voices that end inside seedling -- stolen,
-expired in the sampler queue, or finished playing -- are reclaimed under the
-same policy.
+```text
+amp(category volume x base volume x damping) x distance gain x priority weight
+```
 
-Promoted voices carry `VirtualVoiceBudget::sample_priority` (default 2) as
-their seedling `SamplePriority`, so default-priority `PlayAudio` one-shots
-sharing the pool cannot steal them. Size the target pool so `max_audible`
-plus the crossfades you expect in flight fit within its `PoolSize` --
-during a crossfade the outgoing and incoming voices briefly coexist.
+- **Distance gain** comes from the distance model of the pool the entry's lane
+  routes into, evaluated game-side by [`attenuation`](#game-side-attenuation)
+  against the nearest `SpatialListener2D`, at the same spatial scale the
+  audio thread uses. Waiting entries have no audio node at all, so this is the
+  only place their loudness can come from.
+- **Damping** is the volume a `SoundDampingField` takes off the entry,
+  resolved exactly as the damping write resolves it.
+- `amp` is firewheel's own mapping from a `VolumeNode`'s linear level to the
+  amplitude it applies, so level and distance combine as they do on the audio
+  thread.
+
+Only entries that rank inside their budgets get a real `SamplePlayer`, and
+entries cross the line via `FadeInAudio`/`FadeOutAudio` instead of a hard cut.
+An entry nobody could hear holds no voice. `VirtualSound::with_tier` is a hard
+layer above significance: a higher tier always ranks first, however quiet.
+
+### Budgets
+
+Two budgets bound who holds a voice, and both are ranked, never first-come:
+
+- **Per lane.** A `QueuePoolRouter` sorts each entry into a `QueueLane` -- one
+  sampler pool -- and each lane holds at most its `max_audible` voices.
+- **Per sample.** `VirtualSound::with_max_audible(n)` caps how many entries
+  playing the same sample hold a voice at once. Past the cap the *quietest*
+  copies wait: a swarm of twenty drones plays its five loudest.
+
+Playing **loops** keep an incumbent bonus (`displacement_margin`, ~2 dB by
+default) so two loops of near-equal loudness don't trade places every frame.
+Playing **one-shots** get none, and ties go to the newer: under a cap a rapid
+stream of shots sheds old tails instead of dropping new hits.
+
+### Lifecycle
+
+A sound lives on one entity for its whole logical lifetime. Spawn
+`VirtualSound` directly to keep the entity -- markers, `ChildOf`,
+`DespawnOnExit` and host-driven fades survive every promotion and demotion --
+or write a `PlayQueuedAudio` for a fire-and-forget sound:
 
 ```rust
 app.add_plugins(
-    VirtualVoiceQueuePlugin::<Sound>::new()
-        .with_budget(
-            VirtualVoiceBudget::<Sound>::new(16)
-                .with_crossfade(Duration::from_millis(50))
-                .with_max_wait(Duration::from_millis(500))
-                .with_sample_priority(2),
-        ),
+    VirtualVoiceQueuePlugin::<Sound>::new().with_budget(
+        VirtualVoiceBudget::<Sound>::new()
+            .with_crossfade(Duration::from_millis(50))
+            .with_max_wait(Duration::ZERO),
+    ),
 );
 
-fn play_sounds(mut writer: MessageWriter<PlayQueuedAudio<Sound>>, server: Res<AssetServer>) {
-    // A quiet looping ambience: waits as virtual if the queue is full of
-    // louder things, promoted if room frees up, and comes back after being
-    // temporarily displaced.
-    writer.write(
-        PlayQueuedAudio::new(server.load("wind.ogg"), Sound::Ambience)
+fn spawn_drone_hum(mut commands: Commands, drone: Entity, hum: Handle<AudioSample>) {
+    // Follows the drone, despawns with it, waits silently while five louder
+    // copies hold the voices.
+    commands.spawn((
+        VirtualSound::new(hum, Sound::Sfx)
             .looping()
-            .with_volume(0.2),
-    );
-
-    // A loud explosion: outranks quieter voices and crossfades in, smoothly
-    // displacing whichever currently-audible voice ranks lowest.
-    writer.write(PlayQueuedAudio::new(server.load("explosion.ogg"), Sound::Sfx).with_priority(2.0));
+            .spatial()
+            .with_pitch(1.3)
+            .with_max_audible(5),
+        ChildOf(drone),
+        Transform::default(),
+    ));
 }
 
-fn leave_storm_area(mut stop: MessageWriter<StopQueuedAudio<Sound>>, wind: Res<WindSample>) {
-    // Fade out and drop the ambience loop -- audible entries fade over the
-    // budget's crossfade, waiting virtual entries despawn immediately.
-    stop.write(StopQueuedAudio::<Sound>::all().with_handle(wind.0.clone()));
-
-    // Or stop a whole category:
-    stop.write(StopQueuedAudio::category(Sound::Ambience));
+fn explode(mut writer: MessageWriter<PlayQueuedAudio<Sound>>, boom: Handle<AudioSample>, at: Vec2) {
+    writer.write(PlayQueuedAudio::new(VirtualSound::new(boom, Sound::Sfx).with_tier(2)).at(at));
 }
 ```
 
-A promoted entry carries the bare `C` component for as long as it holds a real
-voice, so the crate's per-sound category systems reach queue voices like any
-other sound of the category: damping fields, the ducking envelope, and -- when
-`MsgSeedlingPlugin` is added for the same `C` -- `StopAudio`, `FadeAudio` and
-the config-driven volume rewrites too. Waiting (virtual) entries carry no `C`,
-and a demoted loop sheds it along with its voice, so prefer `StopQueuedAudio`
-for queue entries: it is the only stop that also reaches the waiting ones, and
-it fades audible ones out through the queue's own crossfade instead of cutting
-them.
+- **Admission.** A one-shot passes the admission controls below on its first
+  frame or is despawned. A loop is always admitted -- it simply waits.
+- **Promotion.** The entry gains a `SamplePlayer` in its lane's pool with the
+  bare `C`, `BaseVolume` and `BasePitch`, so damping, ducking and the
+  config-driven volume rewrites reach it like any other sound. A fresh sound
+  and every one-shot start at full level (a fade-in would blunt the attack); a
+  loop coming back after waiting fades in. `VirtualSound::silent_start()`
+  leaves the start to the host's own fade or per-frame volume write.
+- **Demotion.** A loop fades out, sheds its voice and waits again (playback
+  restarts from the beginning when it returns); a one-shot despawns after its
+  fade.
+- **Waiting.** Loops wait indefinitely; one-shots give up after
+  `VirtualVoiceBudget::max_wait`.
 
-`PlayQueuedAudio` carries no `Randomization` support. Budgets are scoped per
-category type `C`, so e.g. music and SFX never compete for the same slots.
-Significance does not factor in distance for spatial sounds -- bake any
-distance attenuation into `.with_volume()` or `.with_priority()` before
-sending, or cull far requests outright with `.with_max_distance()`.
+Promoted voices carry `VirtualVoiceBudget::sample_priority` plus their tier as
+seedling's `SamplePriority`, and a demoted fader drops to `0`, so if a pool does
+run short it is a fader that gets stolen. Size each pool to its lane's
+`max_audible` plus the crossfades expected in flight.
+
+Waiting entries carry no `C`, so prefer `StopQueuedAudio` for queue entries:
+it is the only stop that also reaches the waiting ones, and it fades audible
+ones out through the queue's own crossfade.
 
 ### Admission controls
 
-Every `PlayQueuedAudio` is admitted by default. Four opt-in controls drop the
-requests not worth queueing at all, before they ever cost a ranking pass --
-each of them off unless set, so an existing queue behaves exactly as before:
+Four opt-in controls drop the one-shots not worth queueing at all, each off
+unless set. Loops are never subject to them; a loop past its
+`with_max_distance` waits instead of being culled.
 
 ```rust
-// One global cap, on the budget: at most 64 requests enter the queue per
-// frame, across every sound. Excess requests are dropped, not deferred --
-// a one-shot delayed a frame would play out of sync with its cause.
-VirtualVoiceBudget::<Sound>::new(16).with_max_admissions_per_frame(64);
+// One global cap, on the budget: at most 64 one-shots enter the queue per
+// frame. Excess is dropped, not deferred -- a one-shot delayed a frame would
+// play out of sync with its cause.
+VirtualVoiceBudget::<Sound>::new().with_max_admissions_per_frame(64);
 
 writer.write(
-    PlayQueuedAudio::new(server.load("ricochet.ogg"), Sound::Sfx)
-        .at(impact_position)
-        // At most 4 live entries playing this same sample...
-        .with_max_concurrent(4)
-        // ...at most 2 of them admitted in any one frame...
-        .with_max_per_frame(2)
-        // ...no sooner than 40ms after the last one...
-        .with_min_repeat_interval(Duration::from_millis(40))
-        // ...and never when it happens off-screen.
-        .with_max_distance(1200.0),
+    PlayQueuedAudio::new(
+        VirtualSound::new(ricochet, Sound::Sfx)
+            // At most 4 live entries playing this same sample...
+            .with_max_concurrent(4)
+            // ...at most 2 of them admitted in any one frame...
+            .with_max_per_frame(2)
+            // ...no sooner than 40ms after the last one...
+            .with_min_repeat_interval(Duration::from_millis(40))
+            // ...and never when it happens off-screen.
+            .with_max_distance(1200.0),
+    )
+    .at(impact_position),
 );
 ```
 
-`with_min_repeat_interval` only tracks admissions that themselves set an
-interval, which keeps its bookkeeping bounded; `with_max_distance` measures in
-the XY plane against a `SpatialListener2D`, and never culls a request without a
-position or an app without such a listener.
+A spatial entry whose parent was spawned this frame has no propagated
+transform yet; its position counts as unknown, which is never culled and ranks
+at full distance gain.
 
-### Bring your own pool
+### Lanes
 
-Two levels, depending on how much of the queue you want to replace.
-
-**Keep the plugin, swap the promotion target.** `VirtualVoiceQueuePlugin`
-promotes into seedling's built-in `SpatialPool`/`DefaultPool` by default; a
-`QueuePoolRouter` replaces just that routing -- say, into your own pool with
-a low-pass node in its effects chain -- while every other queue behavior
-stays:
+The default router has two 16-voice lanes: spatial entries into seedling's
+`SpatialPool`, the rest into `DefaultPool`. A host with its own pools declares
+its own lanes -- each with its label, its voice budget, and the
+`SpatialBasicNode` its pool spatializes with -- and picks one per entry:
 
 ```rust
 app.add_plugins(
     VirtualVoiceQueuePlugin::<Sound>::new().with_pool_router(QueuePoolRouter::new(
-        // At promotion, on the entry about to get its `SamplePlayer`:
-        // insert your pool label, choosing per entry.
-        |ec, sound| {
-            match sound.category() {
-                Sound::Critical => ec.insert(CriticalSpatialPool),
-                _ => ec.insert(DampableSpatialPool),
-            };
-        },
-        // At release: remove what `route` inserted.
-        |ec| {
-            ec.remove::<(CriticalSpatialPool, DampableSpatialPool)>();
+        vec![
+            QueueLane::new(CriticalSpatialPool, 48).with_spatial(spatial_node()),
+            QueueLane::new(DampableSpatialPool, 80).with_spatial(spatial_node()),
+            QueueLane::new(DefaultPool, 24),
+        ],
+        |sound| match (sound.is_spatial(), sound.tier() >= 2) {
+            (true, true) => 0,
+            (true, false) => 1,
+            (false, _) => 2,
         },
     )),
 );
 ```
 
-**Drive your own promotion/demotion.** The queue's whole decision layer is
-public, so a host with its own request pipeline and pools reuses it
-piecewise instead of duplicating it:
+### Bring your own pool
 
-- `AdmissionGate` runs the admission controls above -- the global frame
-  budget plus the per-sample frame cap, concurrency cap, repeat interval and
-  distance cull -- over the same `AdmissionState<C>` resource the plugin
-  uses, against any request type shaped into an `AdmissionRequest`
-  (`PlayQueuedAudio::admission_request()` produces one). The plugin's own
-  enqueue system is built on this gate, so semantics match control for
-  control, and `AdmissionRejection` says which control dropped a request.
-- `rank_by_significance` decides which of a whole set should be audible:
+The decision layer is public for hosts that drive their own pools:
+
+- `AdmissionGate` runs the admission controls over the same
+  `AdmissionState<C>` resource the plugin uses, against any request shaped
+  into an `AdmissionRequest` (`VirtualSound::admission_request` produces one).
+- `rank_voices` decides which of a whole set should be audible, with lanes,
+  tiers and per-key caps:
 
 ```rust
-use msg_seedling::{FadeInAudio, FadeOutAudio, SignificanceEntry, VoiceDecision, rank_by_significance};
+use msg_seedling::{VoiceCandidate, VoiceDecision, rank_voices};
 
-let decisions = rank_by_significance(&entries, max_audible, retiring_count);
+let decisions = rank_voices(&candidates, &lane_capacity);
 // For each `VoiceDecision::Promote`: insert your own pool marker + effects
-// chain + `FadeInAudio::new(crossfade, target_volume)`.
+// chain (+ `FadeInAudio` if it should fade in).
 // For each `VoiceDecision::Demote`: insert `FadeOutAudio::new(crossfade)`.
 ```
 
-- `displacement_target` answers the pairwise steal-on-arrival question
-  instead -- does this newcomer outrank the weakest voice it may displace?
-  -- with an optional *hard* tier above significance, the guarantee a raw
-  priority weight cannot make: a higher tier always displaces a lower one
-  however the loudness compares, a lower tier never displaces a higher one,
-  and same-tier contests use the usual incumbent-bonus hysteresis:
+- `displacement_target` answers the pairwise steal-on-arrival question instead
+  -- does this newcomer outrank the weakest voice it may displace? -- with an
+  optional hard tier above significance:
 
 ```rust
 use msg_seedling::{DEFAULT_DISPLACEMENT_MARGIN, DisplacementCandidate, displacement_target};
@@ -624,6 +632,17 @@ let victim = displacement_target(
 
 `FadeInAudio`/`FadeOutAudio` only need `SampleEffects` to work, so they're
 usable with any pool, not just the ones this crate spawns.
+
+### Game-side attenuation
+
+`msg_seedling::attenuation` evaluates the spatial distance model outside the
+audio thread: `distance_gain` mirrors firewheel's three `DistanceModel`s
+(including the clamps firewheel applies to their parameters), `spatial_gain`
+adds a `SpatialBasicNode`'s own volume and silence floor, and
+`listener_distance` reproduces how `bevy_seedling` turns a world offset into the
+node's offset. Anything that has to know how loud a spatial sound arrives --
+ranking it, culling it, metering it -- gets the same answer the audio thread
+does.
 
 ## Architecture
 
@@ -692,14 +711,17 @@ silence instead of reviving the sound at full volume.
 
 `PlayAudio` is handled entirely by seedling's pool system (`DefaultPool` for
 non-spatial, `SpatialPool` for spatial) -- no manual concurrency limits, and
-no protection against a hard-cut steal when the pool is full. For a voice
-budget that crossfades instead of cutting, use `VirtualVoiceQueuePlugin<C>`
-and `PlayQueuedAudio` (see "Virtual Voice Queue" above).
+no protection against a hard-cut steal when the pool is full. For voices
+ranked by audible loudness under per-pool and per-sample budgets, crossfading
+instead of cutting, use `VirtualVoiceQueuePlugin<C>` (see "Virtual Voice
+Queue" above).
 
 ## Bevy Compatibility
 
 | msg_seedling | bevy_seedling | Bevy |
 |-------------|---------------|------|
+| 0.6         | 0.7           | 0.18 |
+| 0.5         | 0.7           | 0.18 |
 | 0.4         | 0.7           | 0.18 |
 | 0.3         | 0.7           | 0.18 |
 | 0.2         | 0.7           | 0.18 |
