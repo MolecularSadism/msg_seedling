@@ -31,6 +31,13 @@
 //! it. [`baseline`] is where the per-sound halves of it live, and why the
 //! layers compose instead of racing.
 //!
+//! Every factor is a *level* on firewheel's `Volume::Linear` fader scale, not
+//! an amplitude: firewheel applies a level `v` as the amplitude `v²`, so `0.5`
+//! sits 12 dB below unity. Levels multiply into a level, and the product maps
+//! to amplitude once, on the audio thread. Anything that needs the amplitude
+//! itself — ranking voices by loudness, a dB figure — goes through
+//! `Volume::amp`.
+//!
 //! ## Quick Start
 //!
 //! 1. Define your audio categories:

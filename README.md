@@ -367,7 +367,7 @@ steps back a few decibels the moment it starts, and returns once it has had its
 say.
 
 One `DuckingEnvelope` serves the whole mix -- a fast attack, a brief hold, a
-slow release, defaulting to a felt-but-safe -6 dB dip. It never touches a
+slow release, defaulting to a felt-but-safe -12 dB dip. It never touches a
 volume node itself; `DampingPlugin` folds it into the same per-frame volume
 write damping already owns, because two systems writing the same nodes on
 alternate frames would flicker.
@@ -428,8 +428,8 @@ the `back`, which reads the live config.
 Fades of half a second or longer run in decibel space, because a
 linear-amplitude ramp of music length sags audibly down its middle and then
 hangs inaudibly on its tail. One consequence is worth knowing: dB interpolation
-clamps at a -60 dB floor, so a music-length fade-out idles at linear ~0.001
-rather than a true zero. Inaudible on any real mix, but not literally silent.
+clamps at a -60 dB floor, so a music-length fade-out idles at an amplitude of
+~0.001 rather than a true zero. Inaudible on any real mix, but not literally silent.
 
 ## Virtual Voice Queue
 
@@ -666,6 +666,12 @@ node volume = category volume x BaseVolume x damping x duck
 | `BaseVolume` | The `PlayAudio` request: `.with_volume()` x randomization | a component on the sound |
 | damping | Whichever `SoundDampingField`s reach it | resolved per frame |
 | duck | The mix-wide `DuckingEnvelope` | resolved per frame |
+
+Every factor is a *level* on firewheel's `Volume::Linear` fader scale, not an
+amplitude: firewheel applies a level `v` as the amplitude `v²`, so `0.5` sits
+12 dB below unity. Levels multiply into a level, and the product maps to
+amplitude once, on the audio thread; anything that needs the amplitude itself
+-- ranking voices, a dB figure -- goes through `Volume::amp`.
 
 Every system that writes a sound's `VolumeNode` recomputes the whole product
 from those components. That is what makes the layers compose: a volume-slider

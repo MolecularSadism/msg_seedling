@@ -24,7 +24,7 @@ const MIN_GAIN_FACTOR: f32 = 0.00001;
 /// Floor firewheel clamps the reference distance to.
 const MIN_REFERENCE_DISTANCE: f32 = 0.00001;
 
-/// Linear gain the distance model applies at `distance` audio units.
+/// Amplitude gain the distance model applies at `distance` audio units.
 ///
 /// Unity inside the reference distance or with attenuation disabled; a
 /// non-finite or negative distance counts as zero distance.
@@ -60,8 +60,9 @@ pub fn distance_gain(params: &DistanceAttenuation, distance: f32) -> f32 {
     }
 }
 
-/// Linear gain a voice routed through `node` reaches the listener with at
-/// `distance` audio units: the node's own volume times [`distance_gain`],
+/// Amplitude gain a voice routed through `node` reaches the listener with at
+/// `distance` audio units: the amplitude of the node's own volume times
+/// [`distance_gain`],
 /// clamped to silence at or below the node's `min_gain` as the audio thread
 /// does.
 ///
