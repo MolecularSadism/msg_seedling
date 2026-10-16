@@ -536,7 +536,7 @@ mod category_volume_updates {
     #[test]
     fn config_change_updates_steady_samples() {
         let mut app = volume_app();
-        let steady = spawn_sample(&mut app, ());
+        let steady = spawn_sample(&mut app, Name::new("sample"));
 
         app.world_mut().resource_mut::<TestConfig>().sfx = 0.9;
         app.update();
@@ -552,7 +552,7 @@ mod category_volume_updates {
             FadeOutAudio::new(Duration::from_secs(1)).keep_entity(),
         );
         let fading_in = spawn_sample(&mut app, FadeInAudio::new(Duration::from_secs(1), 1.0));
-        let steady = spawn_sample(&mut app, ());
+        let steady = spawn_sample(&mut app, Name::new("sample"));
 
         app.world_mut().resource_mut::<TestConfig>().sfx = 0.9;
         app.update();
@@ -585,7 +585,7 @@ mod category_volume_updates {
     #[test]
     fn a_sound_without_a_baseline_still_follows_the_category() {
         let mut app = volume_app();
-        let bare = spawn_sample(&mut app, ());
+        let bare = spawn_sample(&mut app, Name::new("sample"));
 
         app.world_mut().resource_mut::<TestConfig>().sfx = 0.9;
         app.update();
@@ -615,7 +615,7 @@ mod category_volume_updates {
     #[test]
     fn fade_audio_message_attaches_a_keep_entity_fade() {
         let mut app = volume_app();
-        let sample = spawn_sample(&mut app, ());
+        let sample = spawn_sample(&mut app, Name::new("sample"));
         let other = app
             .world_mut()
             .spawn((
