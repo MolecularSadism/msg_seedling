@@ -21,7 +21,7 @@
 //! | [`mix_fade`] | [`MixFadePlugin<Conf>`](mix_fade::MixFadePlugin) | fading the whole main bus at once |
 //! | [`fade`] | [`fade::plugin`] | `FadeInAudio`/`FadeOutAudio` for any sample entity |
 //! | [`device_follow`] | [`device_follow::plugin`] | keeps the stream on the OS default output device (native only) |
-//! | [`null_backend`] | `SeedlingPlugin::<`[`NullBackend`]`>` | runs the whole graph with no device and meters what it renders (native only) |
+//! | [`null_backend`] | [`NullBackendPlugin`] | runs the whole graph with no device and meters what it renders (native only) |
 //!
 //! ## The volume model
 //!
@@ -205,7 +205,7 @@ pub use fade::{FadeInAudio, FadeOutAudio, FadeSystems};
 pub use messages::{FadeAudio, PlayAudio, SpatialPosition, StopAudio};
 pub use mix_fade::{FadeMix, MixFadePlugin, MixFadeState, MixLevel, fade_target};
 #[cfg(not(target_arch = "wasm32"))]
-pub use null_backend::{NullBackend, NullBackendConfig, NullOutputMeter};
+pub use null_backend::{NullBackendConfig, NullBackendPlugin, NullOutputMeter};
 pub use randomization::{DefaultRandomization, Randomization};
 pub use traits::{AudioCategory, AudioConfig};
 pub use virtual_queue::{
@@ -229,7 +229,7 @@ pub struct VolumeSystems;
 ///
 /// Registers messages and adds all handler and volume systems.
 ///
-/// **Important:** You must also add `SeedlingPlugin::default()` (or your chosen backend)
+/// **Important:** You must also add `SeedlingPlugins` (or your chosen platform plugin)
 /// before adding this plugin.
 ///
 /// Also adds [`BevyAudioGuardPlugin`], which warns when Bevy's own `AudioPlugin`

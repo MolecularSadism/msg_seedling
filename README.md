@@ -22,9 +22,9 @@ the `2d`, `3d` and `ui` feature groups, and nothing here plays through it.
 
 ```toml
 [dependencies]
-msg_seedling = "0.6"
-bevy_seedling = "0.7"
-bevy = { version = "0.18", default-features = false, features = [
+msg_seedling = "0.7"
+bevy_seedling = "0.8"
+bevy = { version = "0.19", default-features = false, features = [
     "2d_bevy_render", "default_app", "picking", "scene",
     "ui_api", "ui_bevy_render",
     "android-game-activity", "bevy_gilrs", "bevy_winit",
@@ -93,7 +93,7 @@ impl AudioCategory for Sound {
 fn main() {
     App::new()
         .add_plugins(DefaultPlugins)
-        .add_plugins(SeedlingPlugin::default())
+        .add_plugins(SeedlingPlugins)
         .add_plugins(MsgSeedlingPlugin::<Sound>::default())
         .init_resource::<AudioSettings>()
         .run();
@@ -111,7 +111,7 @@ composes with it -- add what your game actually uses:
 | `msg_seedling::ducking::plugin` | the whole app | the ducking envelope alone, if you write your own volume nodes |
 | `msg_seedling::fade::plugin` | the whole app | `FadeInAudio`/`FadeOutAudio` alone (already pulled in by the two above) |
 | `msg_seedling::device_follow::plugin` | the whole app (native) | [following the OS default output device](#following-the-os-default-output-device) |
-| `SeedlingPlugin::<NullBackend>` | the whole app (native, replaces the default backend) | [running audio without a device](#running-audio-without-a-device) |
+| `NullBackendPlugin` | the whole app (native, replaces the `cpal` platform plugin) | [running audio without a device](#running-audio-without-a-device) |
 
 ### 4. Play audio
 
@@ -247,7 +247,7 @@ commands.insert_resource(FollowDefaultAudioDevice {
 
 ## Running Audio Without a Device
 
-`NullBackend` is a Firewheel backend with nothing behind it. It renders the
+`NullBackendPlugin` is a `bevy_seedling` platform plugin with no device behind it. It renders the
 whole graph on its own thread at the stream's real-time rate and discards each
 block instead of sending it to the OS, so samplers, buses, filters and fades
 all run while nobody hears anything. Use it for tests, bots, headless runs and
@@ -257,14 +257,17 @@ Each discarded block is summarized into a `NullOutputMeter` — blocks and frame
 rendered, the peak absolute sample, and a count of NaN/infinite samples — so a
 test can assert that sound came out and that it was well-formed. Clones share
 the same counters: keep one as a resource, hand the other to the stream config.
+Add it in place of `bevy_seedling`'s `cpal` platform plugin; changing
+`AudioStreamConfig<NullBackendConfig>` restarts the stream.
 
 ```rust
 let meter = NullOutputMeter::default();
 app.insert_resource(meter.clone());
-app.add_plugins(SeedlingPlugin::<NullBackend> {
-    stream_config: NullBackendConfig { meter, ..default() },
-    ..SeedlingPlugin::<NullBackend>::new()
-});
+app.insert_resource(AudioStreamConfig(NullBackendConfig { meter, ..default() }));
+app.add_plugins((
+    SeedlingPlugins.build().disable::<CpalPlatformPlugin>(),
+    NullBackendPlugin,
+));
 ```
 
 `device_follow::plugin` is inert under this backend: it only acts on the
@@ -328,7 +331,7 @@ carries `SelfDrivenVolume` and keeps its filter and pitch damping while its
 volume is left alone.
 
 **The low-pass axis needs a filter to drive.** It reaches only sounds whose
-pool effect chain carries a `LowPassNode`, and `bevy_seedling` fixes that chain
+pool effect chain carries a stereo `FastLowpassNode`, and `bevy_seedling` fixes that chain
 when the pool is created. Route dampable sounds through a pool of your own that
 includes one, parked at `OPEN_CUTOFF_HZ`; everything else is volume- and
 pitch-damped only.
@@ -728,6 +731,7 @@ Queue" above).
 
 | msg_seedling | bevy_seedling | Bevy |
 |-------------|---------------|------|
+| 0.7         | 0.8           | 0.19 |
 | 0.6         | 0.7           | 0.18 |
 | 0.5         | 0.7           | 0.18 |
 | 0.4         | 0.7           | 0.18 |

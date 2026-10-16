@@ -2577,7 +2577,7 @@ mod tests {
     #[test]
     fn entries_with_a_dead_parent_are_dropped() {
         let mut app = queue_app(1, VirtualVoiceBudget::new());
-        let parent = spawn(&mut app, ());
+        let parent = app.world_mut().spawn_empty().id();
         app.world_mut()
             .write_message(PlayQueuedAudio::new(sound(1).looping()).with_parent(parent));
         app.world_mut().despawn(parent);

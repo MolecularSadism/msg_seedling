@@ -28,10 +28,9 @@
 //! [`MsgSeedlingPlugin`]: crate::MsgSeedlingPlugin
 
 use bevy::prelude::*;
-use bevy_seedling::configuration::{FetchAudioIoEvent, RestartAudioEvent};
-use bevy_seedling::context::{
-    AudioContext, AudioStreamConfig, StreamRestartEvent, StreamStartEvent,
-};
+use bevy_seedling::context::{StreamRestartEvent, StreamStartEvent};
+use bevy_seedling::platform::cpal::{CpalConfig, default_host_enumerator, host_enumerator};
+use bevy_seedling::platform::{AudioStreamConfig, RestartAudioStream};
 use core::time::Duration;
 
 /// Adds OS default-output-device following.
@@ -46,8 +45,7 @@ pub fn plugin(app: &mut App) {
         Update,
         follow_default_device.run_if(
             resource_exists::<FollowDefaultAudioDevice>
-                .and(resource_exists::<AudioContext>)
-                .and(resource_exists::<AudioStreamConfig>),
+                .and_then(resource_exists::<AudioStreamConfig<CpalConfig>>),
         ),
     );
     app.add_observer(resync_on_stream_start);
@@ -56,7 +54,7 @@ pub fn plugin(app: &mut App) {
 
 /// Enables following the operating system's default audio output device.
 ///
-/// While this resource exists (and [`AudioStreamConfig`] does not pin a
+/// While this resource exists (and [`AudioStreamConfig<CpalConfig>`] does not pin a
 /// specific output device), the default output device is polled every
 /// [`poll_interval`](Self::poll_interval); when it changes, the audio stream
 /// restarts on the new default. Remove the resource to stop following.
@@ -99,17 +97,20 @@ impl Default for FollowDefaultState {
     }
 }
 
-/// The id of the device the OS currently reports as the default output.
+/// The id of the device the OS currently reports as the default output on
+/// the stream's host.
 ///
-/// Returns `None` when enumeration fails or yields no devices.
-fn current_default(context: &mut AudioContext) -> Option<String> {
-    context.with(|context| {
-        context
-            .output_devices_simple()
-            .into_iter()
-            .next()
-            .map(|device| device.id)
-    })
+/// Returns `None` when enumeration fails or reports no default.
+fn current_default(config: &CpalConfig) -> Option<String> {
+    let enumerator = match config.output.host {
+        Some(host) => host_enumerator(host).ok()?,
+        None => default_host_enumerator(),
+    };
+    enumerator
+        .output_devices()
+        .into_iter()
+        .find(|device| device.is_default)
+        .map(|device| device.id.to_string())
 }
 
 /// Polls the OS default output device and restarts the stream when it moves.
@@ -117,8 +118,7 @@ fn follow_default_device(
     time: Res<Time>,
     settings: Res<FollowDefaultAudioDevice>,
     mut state: ResMut<FollowDefaultState>,
-    mut context: ResMut<AudioContext>,
-    config: Res<AudioStreamConfig>,
+    config: Res<AudioStreamConfig<CpalConfig>>,
     mut commands: Commands,
 ) {
     let state = &mut *state;
@@ -133,15 +133,12 @@ fn follow_default_device(
     let restart_needed = restart_needed(
         config.0.output.device_id.is_some(),
         &mut state.last_default,
-        || current_default(&mut context),
+        || current_default(&config.0),
     );
 
     if restart_needed {
         bevy::log::info!("System default audio output changed; restarting audio stream.");
-        // Refresh the device entities first: `RestartAudioEvent`'s observer
-        // reads them to re-select a device when the configured one is gone.
-        commands.trigger(FetchAudioIoEvent);
-        commands.trigger(RestartAudioEvent);
+        commands.trigger(RestartAudioStream);
     }
 }
 
@@ -172,18 +169,22 @@ fn restart_needed(
 fn resync_on_stream_start(
     _: On<StreamStartEvent>,
     mut state: ResMut<FollowDefaultState>,
-    mut context: ResMut<AudioContext>,
+    config: Option<Res<AudioStreamConfig<CpalConfig>>>,
 ) {
-    state.last_default = current_default(&mut context);
+    if let Some(config) = config {
+        state.last_default = current_default(&config.0);
+    }
 }
 
 /// See [`resync_on_stream_start`].
 fn resync_on_stream_restart(
     _: On<StreamRestartEvent>,
     mut state: ResMut<FollowDefaultState>,
-    mut context: ResMut<AudioContext>,
+    config: Option<Res<AudioStreamConfig<CpalConfig>>>,
 ) {
-    state.last_default = current_default(&mut context);
+    if let Some(config) = config {
+        state.last_default = current_default(&config.0);
+    }
 }
 
 /// Compares the last-observed default device id against the current one.
