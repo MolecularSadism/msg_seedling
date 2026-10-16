@@ -43,7 +43,7 @@
 //! [`UndampedSound`] marker. A sound whose volume node another system owns
 //! outright carries [`SelfDrivenVolume`] and keeps its filter and pitch
 //! damping while its volume is left alone. The low-pass axis reaches only
-//! sounds whose pool effect chain carries a `LowPassNode` — `bevy_seedling`
+//! sounds whose pool effect chain carries a stereo `FastLowpassNode` — `bevy_seedling`
 //! fixes that chain when the pool is created, so hosts route dampable spatial
 //! sounds through a pool of their own that includes one (with the filter
 //! parked at [`OPEN_CUTOFF_HZ`]); the rest are volume- and pitch-damped only.
@@ -475,7 +475,7 @@ pub fn apply_sound_damping<C: AudioCategory>(
         (With<SamplePlayer>, Without<UndampedSound>),
     >,
     mut volume_nodes: Query<&mut VolumeNode>,
-    mut low_pass_nodes: Query<&mut LowPassNode>,
+    mut low_pass_nodes: Query<&mut FastLowpassNode>,
     mut was_active: Local<bool>,
 ) {
     let has_fields = q_fields.iter().any(|(_, field)| field.radius > 0.0);
@@ -545,16 +545,13 @@ pub fn apply_sound_damping<C: AudioCategory>(
         // Only sounds whose pool chain carries a filter can be muffled; the
         // rest are volume- and pitch-damped only.
         if let Ok(mut low_pass) = low_pass_nodes.get_effect_mut(effects)
-            && low_pass.frequency != damping.cutoff_hz
+            && low_pass.cutoff_hz != damping.cutoff_hz
         {
-            low_pass.frequency = damping.cutoff_hz;
+            low_pass.cutoff_hz = damping.cutoff_hz;
         }
 
         if let (Some(base_pitch), Some(mut settings)) = (base_pitch, settings) {
-            // `PlaybackSettings::speed` is `f32` in some firewheel releases
-            // admitted by the bevy_seedling 0.7 range and `f64` in others;
-            // an f32 product widens into either losslessly via `Into`.
-            let speed = (base_pitch.0 * damping.speed).into();
+            let speed = f64::from(base_pitch.0 * damping.speed);
             if settings.speed != speed {
                 settings.speed = speed;
             }
@@ -890,12 +887,12 @@ mod tests {
             .expect("sound has effects")
             .iter()
             .collect::<Vec<_>>();
-        let mut nodes = world.query::<&LowPassNode>();
+        let mut nodes = world.query::<&FastLowpassNode>();
         effects
             .into_iter()
             .find_map(|effect| nodes.get(world, effect).ok())
-            .expect("effect chain has a LowPassNode")
-            .frequency
+            .expect("effect chain has a FastLowpassNode")
+            .cutoff_hz
     }
 
     #[test]
@@ -1064,8 +1061,9 @@ mod tests {
                 GlobalTransform::default(),
                 sample_effects![
                     VolumeNode::from_linear(0.8),
-                    LowPassNode {
-                        frequency: OPEN_CUTOFF_HZ
+                    FastLowpassNode::<2> {
+                        cutoff_hz: OPEN_CUTOFF_HZ,
+                        ..default()
                     }
                 ],
                 BasePitch(1.0),

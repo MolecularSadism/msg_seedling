@@ -79,7 +79,7 @@ pub fn resolve_randomization(
 /// Used for both axes: volume deviates around the request's own volume,
 /// speed around `1.0`.
 #[cfg(feature = "rand")]
-pub fn deviate(rng: &mut impl rand::Rng, centre: f32, deviation: Option<f32>) -> f32 {
+pub fn deviate(rng: &mut impl rand::RngExt, centre: f32, deviation: Option<f32>) -> f32 {
     let Some(deviation) = deviation.filter(|d| d.is_finite() && *d > 0.0) else {
         return centre;
     };
