@@ -39,7 +39,9 @@
 use audioadapter_buffers::direct::InterleavedSlice;
 use bevy::platform::time::Instant;
 use bevy::prelude::*;
-use bevy_seedling::context::{AudioContext, SampleRate, StreamRestartEvent, pre_restart_stream};
+use bevy_seedling::context::{
+    AudioContext, PreStreamRestartEvent, SampleRate, StreamRestartEvent, pre_restart_stream,
+};
 use bevy_seedling::firewheel::{
     ActivateInfo, backend::BackendProcessInfo, node::StreamStatus, processor::FirewheelProcessor,
 };
@@ -185,6 +187,54 @@ impl Plugin for NullBackendPlugin {
             )
             .add_observer(observe_restart);
     }
+}
+
+/// Starts the null stream when the platform plugin's stream failed to start.
+///
+/// Add it next to the `cpal` platform plugin. A failed device stream leaves
+/// the graph without a sample rate, so `bevy_seedling` never registers its
+/// sample loader and every sample load stays pending; this plugin starts the
+/// null stream in that case, with [`AudioStreamConfig<NullBackendConfig>`].
+/// It drops that stream on [`PreStreamRestartEvent`], so a later restart of
+/// the platform stream (a new default device, a [`RestartAudioStream`]) can
+/// take the graph back.
+#[derive(Debug, Default)]
+pub struct NullFallbackPlugin;
+
+impl Plugin for NullFallbackPlugin {
+    fn build(&self, app: &mut App) {
+        app.init_resource::<AudioStreamConfig<NullBackendConfig>>()
+            .add_systems(
+                PostStartup,
+                start_fallback_stream
+                    .after(SeedlingStartupSystems::StreamInitialization)
+                    .run_if(not(resource_exists::<SampleRate>)),
+            )
+            .add_observer(release_fallback_stream);
+    }
+}
+
+/// The null stream [`NullFallbackPlugin`] runs in place of a failed device;
+/// held only to be dropped.
+#[derive(Resource)]
+struct FallbackStream {
+    _stream: NullStream,
+}
+
+fn start_fallback_stream(
+    mut context: ResMut<AudioContext>,
+    config: Res<AudioStreamConfig<NullBackendConfig>>,
+    mut commands: Commands,
+) -> Result {
+    warn!("no audio output stream, running the audio graph on the null backend");
+    let stream = NullStream::start(&mut context, &config.0)?;
+    commands.insert_resource(FallbackStream { _stream: stream });
+    initialize_stream(SampleRate::new(config.0.sample_rate), commands);
+    Ok(())
+}
+
+fn release_fallback_stream(_: On<PreStreamRestartEvent>, mut commands: Commands) {
+    commands.remove_resource::<FallbackStream>();
 }
 
 /// The running render thread. Dropping it stops the thread, which hands the
@@ -407,6 +457,70 @@ mod tests {
         app.finish();
         app.cleanup();
         (app, meter)
+    }
+
+    /// An app whose platform stream never starts, with the fallback beside it.
+    fn fallback_app() -> (App, NullOutputMeter) {
+        let meter = NullOutputMeter::default();
+        let mut app = App::new();
+        app.insert_resource(AudioStreamConfig(NullBackendConfig {
+            meter: meter.clone(),
+            ..default()
+        }));
+        app.add_plugins((
+            MinimalPlugins,
+            msg_testing::test_asset_plugin(),
+            SeedlingPlugins
+                .build()
+                .disable::<bevy_seedling::platform::cpal::CpalPlatformPlugin>(),
+            NullFallbackPlugin,
+        ));
+        app.finish();
+        app.cleanup();
+        (app, meter)
+    }
+
+    #[test]
+    fn a_failed_platform_stream_falls_back_to_the_null_stream() {
+        let (mut app, meter) = fallback_app();
+
+        assert!(
+            app.update_until(BUDGET, |_| meter.blocks() > 0),
+            "the fallback stream never rendered"
+        );
+        assert!(app.world().contains_resource::<FallbackStream>());
+        assert!(app.world().contains_resource::<SampleRate>());
+    }
+
+    #[test]
+    fn a_running_platform_stream_keeps_the_fallback_idle() {
+        let mut app = App::new();
+        app.add_plugins((
+            MinimalPlugins,
+            msg_testing::test_asset_plugin(),
+            SeedlingPlugins
+                .build()
+                .disable::<bevy_seedling::platform::cpal::CpalPlatformPlugin>(),
+            NullBackendPlugin,
+            NullFallbackPlugin,
+        ));
+        app.finish();
+        app.cleanup();
+        app.update();
+
+        assert!(app.world().contains_resource::<NullStream>());
+        assert!(!app.world().contains_resource::<FallbackStream>());
+    }
+
+    #[test]
+    fn a_stream_restart_releases_the_fallback() {
+        let (mut app, meter) = fallback_app();
+        assert!(app.update_until(BUDGET, |_| meter.blocks() > 0));
+
+        app.world_mut().trigger(PreStreamRestartEvent);
+        app.world_mut().flush();
+
+        assert!(!app.world().contains_resource::<FallbackStream>());
     }
 
     #[test]
