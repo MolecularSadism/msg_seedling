@@ -22,6 +22,7 @@
 //! | [`fade`] | [`fade::plugin`] | `FadeInAudio`/`FadeOutAudio` for any sample entity |
 //! | [`device_follow`] | [`device_follow::plugin`] | keeps the stream on the OS default output device (native only) |
 //! | [`null_backend`] | [`NullBackendPlugin`] | runs the whole graph with no device and meters what it renders (native only) |
+//! | [`null_backend`] | [`NullFallbackPlugin`] | runs the graph on the null backend when the device stream fails to start (native only) |
 //!
 //! ## The volume model
 //!
@@ -205,7 +206,7 @@ pub use fade::{FadeInAudio, FadeOutAudio, FadeSystems};
 pub use messages::{FadeAudio, PlayAudio, SpatialPosition, StopAudio};
 pub use mix_fade::{FadeMix, MixFadePlugin, MixFadeState, MixLevel, fade_target};
 #[cfg(not(target_arch = "wasm32"))]
-pub use null_backend::{NullBackendConfig, NullBackendPlugin, NullOutputMeter};
+pub use null_backend::{NullBackendConfig, NullBackendPlugin, NullFallbackPlugin, NullOutputMeter};
 pub use randomization::{DefaultRandomization, Randomization};
 pub use traits::{AudioCategory, AudioConfig};
 pub use virtual_queue::{

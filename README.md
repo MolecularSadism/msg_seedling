@@ -112,6 +112,7 @@ composes with it -- add what your game actually uses:
 | `msg_seedling::fade::plugin` | the whole app | `FadeInAudio`/`FadeOutAudio` alone (already pulled in by the two above) |
 | `msg_seedling::device_follow::plugin` | the whole app (native) | [following the OS default output device](#following-the-os-default-output-device) |
 | `NullBackendPlugin` | the whole app (native, replaces the `cpal` platform plugin) | [running audio without a device](#running-audio-without-a-device) |
+| `NullFallbackPlugin` | the whole app (native, next to the `cpal` platform plugin) | [running audio without a device](#running-audio-without-a-device) |
 
 ### 4. Play audio
 
@@ -272,6 +273,17 @@ app.add_plugins((
 
 `device_follow::plugin` is inert under this backend: it only acts on the
 `cpal` stream config. Native only.
+
+`NullFallbackPlugin` keeps the `cpal` platform and starts the null stream only
+when the device stream fails to start (no output device, a driver refusing the
+format). Without a running stream `bevy_seedling` never registers its sample
+loader, so every sample load would stay pending forever. The fallback stream
+reads the same `AudioStreamConfig<NullBackendConfig>` and is dropped before any
+stream restart, so a new default device takes the graph back.
+
+```rust
+app.add_plugins((SeedlingPlugins, NullFallbackPlugin));
+```
 
 ## Sound Damping Fields
 
