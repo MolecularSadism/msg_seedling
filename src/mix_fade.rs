@@ -121,6 +121,7 @@ impl Default for MixFadeState {
 ///
 /// Trigger it as an event; [`MixFadePlugin`] installs the observer.
 #[derive(Event, Reflect, Debug, Clone, Copy)]
+#[reflect(Event)]
 pub struct FadeMix {
     /// Where the bus is headed.
     pub to: MixLevel,
@@ -225,6 +226,26 @@ mod tests {
     #[test]
     fn the_mix_starts_pointed_at_full() {
         assert_eq!(MixFadeState::default().target, MixLevel::Full);
+    }
+
+    #[derive(Resource, Clone, Default)]
+    struct TestConfig;
+
+    impl AudioConfig for TestConfig {
+        fn master_volume(&self) -> f32 {
+            1.0
+        }
+    }
+
+    #[test]
+    fn fade_mix_registers_for_reflection() {
+        let mut app = App::new();
+        app.add_plugins(MixFadePlugin::<TestConfig>::default());
+        let registry = app.world().resource::<AppTypeRegistry>().read();
+        let registration = registry
+            .get(std::any::TypeId::of::<FadeMix>())
+            .expect("FadeMix is registered");
+        assert!(registration.data::<ReflectEvent>().is_some());
     }
 
     #[test]
