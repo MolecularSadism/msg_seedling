@@ -12,7 +12,7 @@ use bevy::prelude::*;
 ///
 /// Deviation values represent a ± range around 1.0. For example, `0.2` means
 /// the final value will be randomly chosen in `[0.8, 1.2]`.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, Reflect)]
 pub enum Randomization {
     /// Use plugin-configured defaults for both volume and speed.
     #[default]

@@ -614,7 +614,8 @@ pub struct Retiring;
 /// `position`. Either makes the sound spatial. A request whose parent no
 /// longer exists is dropped — a spatial sound of a dead emitter must not
 /// play at the origin.
-#[derive(Message, Clone)]
+#[derive(Message, Clone, Reflect)]
+#[reflect(Message)]
 pub struct PlayQueuedAudio<C: AudioCategory> {
     /// The sound to play.
     pub sound: VirtualSound<C>,
@@ -870,6 +871,7 @@ impl<C: AudioCategory> Plugin for VirtualVoiceQueuePlugin<C> {
         app.insert_resource(self.budget.clone());
         app.insert_resource(self.pool_router.clone());
         app.add_message::<PlayQueuedAudio<C>>();
+        app.register_type::<PlayQueuedAudio<C>>();
         app.add_message::<StopQueuedAudio<C>>();
         app.configure_sets(Update, VirtualQueueSystems.after(FadeSystems));
         app.add_systems(
@@ -1923,6 +1925,16 @@ mod tests {
                 TestSound::Ambience => config.ambience,
             }
         }
+    }
+
+    #[test]
+    fn play_queued_audio_registers_for_reflection() {
+        let app = queue_app(1, VirtualVoiceBudget::default());
+        let registry = app.world().resource::<AppTypeRegistry>().read();
+        let registration = registry
+            .get(std::any::TypeId::of::<PlayQueuedAudio<TestSound>>())
+            .expect("PlayQueuedAudio is registered");
+        assert!(registration.data::<ReflectMessage>().is_some());
     }
 
     /// The default two-lane router with `voices` per lane.

@@ -342,6 +342,9 @@ impl<C: AudioCategory> Plugin for MsgSeedlingPlugin<C> {
         app.add_message::<PlayAudio<C>>();
         app.add_message::<StopAudio<C>>();
         app.add_message::<FadeAudio<C>>();
+        app.register_type::<PlayAudio<C>>();
+        app.register_type::<StopAudio<C>>();
+        app.register_type::<FadeAudio<C>>();
 
         // Add systems
         app.add_systems(

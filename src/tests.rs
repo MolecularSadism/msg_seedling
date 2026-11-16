@@ -376,6 +376,28 @@ fn plugin_custom_randomization() {
     assert_eq!(defaults.speed, None);
 }
 
+#[test]
+fn plugin_registers_messages_for_reflection() {
+    let mut app = App::new();
+    app.add_plugins(MinimalPlugins);
+    app.init_resource::<TestConfig>();
+    app.add_plugins(crate::MsgSeedlingPlugin::<TestSound>::default());
+
+    let registry = app.world().resource::<AppTypeRegistry>().read();
+    for type_id in [
+        std::any::TypeId::of::<PlayAudio<TestSound>>(),
+        std::any::TypeId::of::<StopAudio<TestSound>>(),
+        std::any::TypeId::of::<FadeAudio<TestSound>>(),
+    ] {
+        let registration = registry.get(type_id).expect("message type is registered");
+        assert!(
+            registration.data::<ReflectMessage>().is_some(),
+            "{} lacks ReflectMessage",
+            registration.type_info().type_path()
+        );
+    }
+}
+
 // -- Spawn-time baselines --
 
 mod spawned_baselines {
