@@ -667,7 +667,8 @@ impl<C: AudioCategory> From<VirtualSound<C>> for PlayQueuedAudio<C> {
 /// the start of the frame are stopped: a [`PlayQueuedAudio`] written the
 /// same frame spawns its entry after stop handling, so the just-requested
 /// sound plays on.
-#[derive(Message, Clone)]
+#[derive(Message, Clone, Reflect)]
+#[reflect(Message)]
 pub struct StopQueuedAudio<C: AudioCategory> {
     /// The category to stop. `None` = stop every queued entry of type `C`.
     pub category: Option<C>,
@@ -873,6 +874,7 @@ impl<C: AudioCategory> Plugin for VirtualVoiceQueuePlugin<C> {
         app.add_message::<PlayQueuedAudio<C>>();
         app.register_type::<PlayQueuedAudio<C>>();
         app.add_message::<StopQueuedAudio<C>>();
+        app.register_type::<StopQueuedAudio<C>>();
         app.configure_sets(Update, VirtualQueueSystems.after(FadeSystems));
         app.add_systems(
             Update,
@@ -1928,13 +1930,20 @@ mod tests {
     }
 
     #[test]
-    fn play_queued_audio_registers_for_reflection() {
+    fn queue_messages_register_for_reflection() {
         let app = queue_app(1, VirtualVoiceBudget::default());
         let registry = app.world().resource::<AppTypeRegistry>().read();
-        let registration = registry
-            .get(std::any::TypeId::of::<PlayQueuedAudio<TestSound>>())
-            .expect("PlayQueuedAudio is registered");
-        assert!(registration.data::<ReflectMessage>().is_some());
+        for type_id in [
+            std::any::TypeId::of::<PlayQueuedAudio<TestSound>>(),
+            std::any::TypeId::of::<StopQueuedAudio<TestSound>>(),
+        ] {
+            let registration = registry.get(type_id).expect("message type is registered");
+            assert!(
+                registration.data::<ReflectMessage>().is_some(),
+                "{} lacks ReflectMessage",
+                registration.type_info().type_path()
+            );
+        }
     }
 
     /// The default two-lane router with `voices` per lane.
