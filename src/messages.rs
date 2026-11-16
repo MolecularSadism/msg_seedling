@@ -78,7 +78,8 @@ impl SpatialPosition {
 /// # app.add_systems(Update, play_sounds);
 /// # app.update();
 /// ```
-#[derive(Message, Clone)]
+#[derive(Message, Clone, Reflect)]
+#[reflect(Message)]
 pub struct PlayAudio<C: AudioCategory> {
     /// Handle to the audio sample.
     pub handle: Handle<bevy_seedling::sample::AudioSample>,
@@ -179,7 +180,8 @@ impl<C: AudioCategory> PlayAudio<C> {
 /// # app.add_systems(Update, stop_sounds);
 /// # app.update();
 /// ```
-#[derive(Message, Clone)]
+#[derive(Message, Clone, Reflect)]
+#[reflect(Message)]
 pub struct StopAudio<C: AudioCategory> {
     /// The category to stop. `None` = stop all audio.
     pub category: Option<C>,
@@ -232,7 +234,8 @@ impl<C: AudioCategory> StopAudio<C> {
 /// # app.add_systems(Update, fade_music);
 /// # app.update();
 /// ```
-#[derive(Message, Clone)]
+#[derive(Message, Clone, Reflect)]
+#[reflect(Message)]
 pub struct FadeAudio<C: AudioCategory> {
     /// The category to fade out.
     pub category: C,
